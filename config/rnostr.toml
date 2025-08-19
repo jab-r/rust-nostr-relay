@@ -1,0 +1,80 @@
+[information]
+name = "MLS Secure Relay"
+description = "High-security MLS-over-Nostr relay for isolated environments"
+software = "https://github.com/rnostr/rnostr"
+
+[data]
+# LMDB path; on Cloud Run this is ephemeral unless on GCE/GKE
+path = "./data"
+db_query_timeout = "100ms"
+
+[network]
+# Cloud Run expects listening on 0.0.0.0
+host = "0.0.0.0"
+port = 8080
+
+[limitation]
+max_message_length = 1048576      # 1MB for MLS artifacts if needed
+max_subscriptions = 50
+max_filters = 20
+max_limit = 1000
+max_subid_length = 100
+min_prefix = 10
+max_event_tags = 5000
+max_event_time_older_than_now = 94608000
+max_event_time_newer_than_now = 900
+
+[metrics]
+enabled = true
+auth = "replace_with_secure_metrics_key"
+
+[auth]
+enabled = true
+
+[auth.req]
+# No IP restrictions - mobile devices need dynamic IP access
+# Authentication handled via NIP-42 only
+
+[auth.event]
+# High-security: only allow NIP-42-verified pubkeys for event publishing
+# Uncomment and add specific pubkeys when ready to restrict access:
+# pubkey_whitelist = [
+#   "npub1your_trusted_pubkey_1_here",
+#   "npub1your_trusted_pubkey_2_here"
+# ]
+# event_pubkey_whitelist = ["npub1..."]
+
+[rate_limiter]
+enabled = true
+
+[[rate_limiter.event]]
+name = "mls_group_messages"
+description = "MLS messages (kind 445)"
+period = "1m"
+limit = 100
+kinds = [445]
+
+[[rate_limiter.event]]
+name = "noise_dms"
+description = "Noise DMs (kind 446)"
+period = "1m"
+limit = 50
+kinds = [446]
+
+[count]
+enabled = false
+
+[search]
+enabled = false
+
+# MLS Gateway Extension Configuration
+[extensions.mls_gateway]
+enabled = true
+storage_backend = "firestore"
+project_id = "loxation-f8e1c"
+keypackage_ttl = 604800  # 7 days
+welcome_ttl = 259200     # 3 days
+enable_api = true
+api_prefix = "/api/v1"
+enable_message_archive = true
+message_archive_ttl_days = 30

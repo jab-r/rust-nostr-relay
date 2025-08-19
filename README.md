@@ -1,148 +1,247 @@
-# Rnostr
+# MLS Secure Relay - High-Security Nostr Relay with MLS Gateway
 
-A high-performance and scalable [nostr](https://github.com/nostr-protocol/nostr) relay written in Rust.
+A vendored deployment of [rnostr](https://github.com/rnostr/rnostr) enhanced with MLS Gateway Extension for high-security MLS-over-Nostr messaging. Designed to replace loxation-messaging infrastructure on Google Cloud Run.
 
 ## Features
 
-- [Most NIPs support](#nips)
-- Easy to use, no third-party service dependencies
-- High performance, Events is stored in [LMDB](https://github.com/LMDB/lmdb), Inspired by [strfry](https://github.com/hoytech/strfry)
-- Most configurations can be hot reloaded
-- Scalability, can be used as a library to [create custom relays](./relay/README.md)
+- **Standards-Compliant Nostr Relay**: Full Nostr protocol support with WebSocket connectivity
+- **MLS Gateway Extension**: 
+  - MLS group messaging (kind 445) and Noise DM (kind 446) routing
+  - Key package and welcome message mailbox services
+  - Group registry (non-authoritative)
+  - REST API endpoints for auxiliary flows
+- **High-Security Architecture**:
+  - NIP-42 authentication with pubkey allowlisting
+  - IP-based access control via Cloud Armor
+  - Isolated environment with no public federation
+  - Cloud SQL integration for MLS metadata
+- **Cloud-Native Deployment**:
+  - Google Cloud Run with session affinity
+  - Auto-scaling with LMDB consistency (single instance)
+  - Cloud SQL PostgreSQL backend
+  - Comprehensive observability
 
-### [NIPs](https://github.com/nostr-protocol/nips)
+## Quick Start
 
-- [x] NIP-01: Basic protocol flow description
-- [x] NIP-02: Contact list and petnames
-- [x] NIP-04: Encrypted Direct Message
-- [x] NIP-09: Event deletion
-- [x] NIP-11: Relay information document
-- [x] NIP-12: Generic tag queries
-- [ ] NIP-13: Proof of Work
-- [x] NIP-15: End of Stored Events Notice
-- [x] NIP-16: Event Treatment
-- [x] NIP-20: Command Results
-- [x] NIP-22: Event `created_at` Limits
-- [x] NIP-25: Reactions
-- [x] NIP-26: Delegated Event Signing
-- [x] NIP-28: Public Chat
-- [x] NIP-33: Parameterized Replaceable Events
-- [x] NIP-40: Expiration Timestamp
-- [x] NIP-42: Authentication of clients to relays
-- [x] NIP-45: Counting results. [experimental](#count)
-- [x] NIP-50: Keywords filter. [experimental](#search)
-- [x] NIP-70: Protected Events
+### Prerequisites
 
-### Extensions
+- Google Cloud Project with billing enabled
+- Cloud SQL PostgreSQL instance
+- Docker and gcloud CLI installed
+- Authentication configured: `gcloud auth login`
 
-The library [nostr-relay](./relay/) implements a simple extension mechanism to intercept user messages for custom processing. rnostr is built on top of [nostr-relay](./relay/) and implements several simple extensions.
-All extensions support configuration in the [config file](./rnostr.example.toml).
+### Deployment
 
-[Custom relay and extensions](./relay/).
-
-#### Metrics
-
-Provide metrics url for [prometheus](https://prometheus.io/) scrape
-
-#### Auth
-
-[NIP-42](https://nips.be/42) Authentication, ip, auth pubkey and event pubkey whitelist blacklist
-
-#### Rate limiter
-
-Limit event write frequency.
-
-#### Count
-
-[NIP-45](https://nips.be/45) count results.
-When the query results are too large (millions) will trigger a slow query. `setting.data.db_query_timeout`.
-
-#### Search
-
-[NIP-50](https://nips.be/50) Keywords filter. [nostr-db](./db/) implement a simple exact match pattern, case-insensitive, time-sorted full-text search. No performance optimization for multi-word queries, so it's experimental.
-
-It reduces write concurrency and makes space usage significantly larger. So it is suitable for use in private or paid relay.
-
-Now we only index the content of `kind: 1` note event.
-
-## Usage
-
-### Prepare source and config
-
-```shell
-
-git clone https://github.com/rnostr/rnostr.git
-cd rnostr
-mkdir config
-cp ./rnostr.example.toml ./config/rnostr.toml
-
+1. **Set Environment Variables**:
+```bash
+export GOOGLE_CLOUD_PROJECT="your-project-id"
+export DATABASE_URL="postgresql://user:password@host/mls_gateway"
+export INSTANCE_CONNECTION_NAME="project:region:instance"
+export METRICS_AUTH_KEY="$(openssl rand -hex 32)"
 ```
 
-Edit the `./config/rnostr.toml`, remember to modify network.host to `0.0.0.0` for public access.
-
-### Build and run
-
-```shell
-
-# Build
-cargo build --release
-
-# Show help
-./target/release/rnostr relay --help
-
-# Run with config hot reload
-./target/release/rnostr relay -c ./config/rnostr.toml --watch
-
+2. **Deploy to Cloud Run**:
+```bash
+./scripts/deploy.sh --project-id $GOOGLE_CLOUD_PROJECT --sql-instance $INSTANCE_CONNECTION_NAME
 ```
 
-### Docker
-
-```shell
-
-# Create data dir
-mkdir ./data
-
-docker run -it --rm -p 8080:8080 \
-  --user=$(id -u) \
-  -v $(pwd)/data:/rnostr/data \
-  -v $(pwd)/config:/rnostr/config \
-  --name rnostr rnostr/rnostr:latest
-
+3. **Configure Database Schema**:
+```bash
+# Connect to Cloud SQL and run the migrations
+# The schema will be automatically created on first startup
 ```
 
-Build by self
-
-```shell
-
-docker build . -t rnostr/rnostr
-
-# Build in China need to configure the mirror.
-docker build . -t rnostr/rnostr --build-arg BASE=mirror_cn
+## Architecture
 
 ```
-
-See docker compose [example](./docker-compose.yml)
-
-### Commands
-
-rnostr provides other commands such as import and export.
-
-```shell
-
-./target/release/rnostr --help
-
-# Usage: rnostr <COMMAND>
-
-# Commands:
-#   import  Import data from jsonl file
-#   export  Export data to jsonl file
-#   bench   Benchmark filter
-#   relay   Start nostr relay server
-#   delete  Delete data by filter
-#   help    Print this message or the help of the given subcommand(s)
-
-# Options:
-#   -h, --help     Print help
-#   -V, --version  Print version
-
+┌─────────────────┐    WSS     ┌─────────────────┐
+│   Nostr Client  │ ────────── │   Cloud Run     │
+└─────────────────┘  NIP-42    │   rnostr Core   │
+                                └─────────────────┘
+                                         │
+                                         ▼
+                                ┌─────────────────┐
+                                │ MLS Gateway Ext │
+                                └─────────────────┘
+                                         │
+                                         ▼
+                                ┌─────────────────┐
+                                │  Cloud SQL      │
+                                │  PostgreSQL     │
+                                └─────────────────┘
 ```
+
+### Event Flow
+
+1. **Kind 445 (MLS Group Messages)**:
+   - Extract `#h` (group ID) and `#e` (epoch) tags
+   - Update group registry with metadata
+   - Store event in LMDB for relay functionality
+
+2. **Kind 446 (Noise DMs)**:
+   - Extract `#p` (recipient) tags for routing
+   - Content remains opaque (end-to-end encrypted)
+   - Standard Nostr relay functionality
+
+3. **Mailbox Services** (REST API):
+   - `POST /api/v1/keypackages` - Store key packages
+   - `GET /api/v1/keypackages?recipient=npub...` - Retrieve packages
+   - `POST /api/v1/welcome` - Store welcome messages
+   - `GET /api/v1/welcome?recipient=npub...` - Retrieve welcomes
+
+## Configuration
+
+### Environment Variables
+
+| Variable | Description | Required |
+|----------|-------------|----------|
+| `GOOGLE_CLOUD_PROJECT` | GCP project ID | ✅ |
+| `DATABASE_URL` | Cloud SQL connection string | ✅ |
+| `INSTANCE_CONNECTION_NAME` | Cloud SQL instance identifier | ✅ |
+| `METRICS_AUTH_KEY` | Authentication key for /metrics endpoint | ✅ |
+| `RUST_LOG` | Log level (default: info) | ❌ |
+| `ALLOWED_ORIGINS` | WebSocket CORS origins | ❌ |
+
+### Security Configuration
+
+Edit [`config/rnostr.toml`](config/rnostr.toml):
+
+```toml
+[auth.req]
+ip_whitelist = ["10.0.0.0/8", "172.16.0.0/12"]
+
+[auth.event]
+pubkey_whitelist = ["npub1abc...", "npub1def..."]
+event_pubkey_whitelist = ["npub1ghi..."]
+```
+
+## Migration from loxation-messaging
+
+### Phase 1: Parallel Deployment
+1. Deploy MLS Secure Relay alongside existing loxation-messaging
+2. Configure test clients to connect to new relay
+3. Validate feature parity and performance
+
+### Phase 2: Client Migration
+1. Update client applications to use Nostr protocol
+2. Implement NIP-42 authentication in clients
+3. Test MLS message routing and mailbox functionality
+
+### Phase 3: Cutover
+1. Update DNS/load balancer to point to new service
+2. Monitor metrics and error rates
+3. Decommission loxation-messaging after stability period
+
+### Protocol Changes
+
+| **loxation-messaging** | **MLS Secure Relay** |
+|------------------------|----------------------|
+| Custom WebSocket API | Standard Nostr Protocol |
+| JWT token auth | NIP-42 cryptographic auth |
+| Firebase/Firestore | LMDB + Cloud SQL |
+| Custom message format | Nostr events (kinds 445/446) |
+
+## Operations
+
+### Monitoring
+
+- **Service Health**: `GET /health` endpoint
+- **Metrics**: `GET /metrics` (authenticated)
+- **Logs**: `gcloud logs tail --follow projects/$PROJECT/services/mls-secure-relay`
+
+### Key Metrics
+
+- `mls_gateway_events_processed` - Events by kind
+- `mls_gateway_groups_updated` - Group registry updates  
+- `mls_gateway_keypackages_stored` - Mailbox deposits
+- `nostr_relay_connections_active` - Active WebSocket connections
+
+### Maintenance
+
+#### Database Cleanup
+```bash
+# Cleanup expired mailbox items (runs automatically)
+# Manual cleanup via SQL if needed:
+DELETE FROM mail_keypackages WHERE expires_at < NOW();
+DELETE FROM mail_welcomes WHERE expires_at < NOW();
+```
+
+#### Configuration Updates
+```bash
+# Update configuration and restart service
+gcloud run services replace cloud-run-service.yaml
+```
+
+#### Scaling Considerations
+- **Single Instance**: Required for LMDB consistency
+- **Memory**: Monitor LMDB size, increase if needed
+- **CPU**: Scale based on WebSocket connection load
+- **Network**: Internal ingress with VPC connectivity
+
+## Development
+
+### Local Development
+```bash
+# Install dependencies
+cargo build
+
+# Run with local config
+cargo run -- relay -c config/rnostr.toml
+
+# Test MLS Gateway extension
+curl http://localhost:8080/api/v1/groups
+```
+
+### Testing
+```bash
+# Run unit tests
+cargo test
+
+# Integration tests with database
+DATABASE_URL=postgresql://localhost/test_mls cargo test
+```
+
+## Security Considerations
+
+- **Network Isolation**: Deploy with internal ingress only
+- **Authentication**: Require NIP-42 for all connections
+- **Authorization**: Use pubkey allowlists for event publishing
+- **Data Protection**: All message content remains encrypted and opaque
+- **Secrets Management**: Use Cloud Secret Manager for sensitive data
+- **Audit Logging**: Enable Cloud Audit Logs for compliance
+
+## Troubleshooting
+
+### Common Issues
+
+1. **Database Connection Failed**
+   - Verify Cloud SQL instance is running
+   - Check `INSTANCE_CONNECTION_NAME` format
+   - Ensure service account has Cloud SQL Client role
+
+2. **WebSocket Connection Rejected**
+   - Verify NIP-42 authentication implementation
+   - Check pubkey allowlist configuration
+   - Review IP allowlist settings
+
+3. **High Memory Usage**
+   - Monitor LMDB database size
+   - Consider data retention policies
+   - Scale Cloud Run memory allocation
+
+4. **MLS Events Not Processing**
+   - Check event kind filtering (445/446)
+   - Verify tag extraction (`#h`, `#e`, `#p`)
+   - Review Cloud SQL connection
+
+### Support
+
+For deployment issues:
+1. Check Cloud Run logs: `gcloud logs tail --follow`
+2. Verify configuration: `kubectl get service mls-secure-relay -o yaml`
+3. Test database connectivity: Check Cloud SQL logs
+4. Monitor metrics: Review `/metrics` endpoint
+
+## License
+
+This project inherits the license from the upstream rnostr project: MIT OR Apache-2.0

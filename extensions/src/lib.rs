@@ -21,6 +21,11 @@ pub mod search;
 #[cfg(feature = "search")]
 pub use search::Search;
 
+#[cfg(feature = "mls_gateway")]
+pub mod mls_gateway;
+#[cfg(feature = "mls_gateway")]
+pub use mls_gateway::MlsGateway;
+
 #[cfg(test)]
 pub fn temp_data_path(p: &str) -> anyhow::Result<tempfile::TempDir> {
     Ok(tempfile::Builder::new()

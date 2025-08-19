@@ -1,98 +1,63 @@
-# This image uses cargo-chef to build the application in order to compile
-# the dependencies apart from the main application. This allows the compiled
-# dependencies to be cached in the Docker layer and greatly reduce the
-# build time when there isn't any dependency changes.
-#
-# https://github.com/LukeMathWalker/cargo-chef
-# https://github.com/RGB-WG/rgb-node/blob/master/Dockerfile
+# Multi-stage build for rust-nostr-relay with MLS Gateway Extension
+# Simplified version for Cloud Run deployment
 
-ARG SRC_DIR=/usr/local/src/rnostr
-ARG BUILDER_DIR=/srv/rnostr
+# Build stage
+FROM rust:1.89-slim AS builder
 
-# build base
-ARG BASE=base
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
-# Base image
-FROM rust:1.80.1-slim-bullseye as base
+WORKDIR /app
 
-# mirror image for china
-FROM base as mirror_cn
-
-# Replace cn mirrors
-ENV RUSTUP_DIST_SERVER=https://rsproxy.cn
-RUN sed -i 's/deb.debian.org/mirrors.ustc.edu.cn/g' /etc/apt/sources.list
-RUN echo '[source.crates-io]\nreplace-with = "rsproxy-sparse"\n[source.rsproxy]\nregistry = "https://rsproxy.cn/crates.io-index"\n[source.rsproxy-sparse]\nregistry = "sparse+https://rsproxy.cn/index/"\n[registries.rsproxy]\nindex = "https://rsproxy.cn/crates.io-index"' >> $CARGO_HOME/config.toml
-
-FROM ${BASE} as chef
-
-ARG SRC_DIR
-ARG BUILDER_DIR
-
-RUN apt-get update && apt-get install -y build-essential
-
-RUN rustup default stable
-RUN rustup update
-RUN cargo install cargo-chef --locked
-
-WORKDIR $SRC_DIR
-
-# Cargo chef step that analyzes the project to determine the minimum subset of
-# files (Cargo.lock and Cargo.toml manifests) required to build it and cache
-# dependencies
-FROM chef AS planner
-
+# Copy all source code
 COPY . .
-RUN cargo chef prepare --recipe-path recipe.json
 
-FROM chef AS builder
+# Build the application with MLS features (no-default-features to avoid search issues)
+RUN cargo build --release --bin rnostr --no-default-features --features mls_gateway_firestore
 
-ARG SRC_DIR
-ARG BUILDER_DIR
+# Runtime stage
+FROM debian:bookworm-slim
 
-COPY --from=planner "${SRC_DIR}/recipe.json" recipe.json
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
 
-# Build dependencies - this is the caching Docker layer
-RUN cargo chef cook --release --recipe-path recipe.json --target-dir "${BUILDER_DIR}"
+# Create app user for security
+RUN useradd -r -u 1001 -g root appuser
 
-# Copy all files and build application # --all-features
-COPY . .
-RUN cargo build --release --target-dir "${BUILDER_DIR}" --bins
+WORKDIR /app
 
-# Final image with binaries
-FROM debian:bullseye-slim as final
+# Copy the binary from builder stage
+COPY --from=builder /app/target/release/rnostr ./
 
-ARG SRC_DIR
-ARG BUILDER_DIR
+# Copy configuration files
+COPY config/ ./config/
 
-ARG BIN_DIR=/usr/local/bin
-ARG HOME_DIR=/rnostr
-ARG DATA_DIR=${HOME_DIR}/data
-# use dir for watch config file change
-ARG CONF_DIR=${HOME_DIR}/config
-ARG USER=rnostr
+# Create directory for LMDB database
+RUN mkdir -p ./data && chown appuser:root ./data
 
-RUN adduser --home "${HOME_DIR}" --shell /bin/bash --disabled-login \
-        --gecos "${USER} user" ${USER}
-RUN mkdir ${DATA_DIR} ${CONF_DIR}
-RUN chown ${USER}:${USER} ${DATA_DIR} ${CONF_DIR}
+# Set permissions
+RUN chown appuser:root ./rnostr && chmod +x ./rnostr
 
-COPY --from=builder --chown=${USER}:${USER} \
-        "${BUILDER_DIR}/release/rnostr" "${BIN_DIR}"
-COPY --from=builder --chown=${USER}:${USER} \
-        "${SRC_DIR}/rnostr.example.toml" "${CONF_DIR}/rnostr.toml"
+# Switch to non-root user
+USER appuser
 
-# Change default bind address to 0.0.0.0
-ENV RNOSTR_NETWORK__HOST=0.0.0.0
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
 
-WORKDIR "${HOME_DIR}"
-
-USER ${USER}
-
-VOLUME "$DATA_DIR"
-VOLUME "$CONF_DIR"
-
+# Expose port
 EXPOSE 8080
 
-ENTRYPOINT ["rnostr"]
+# Set environment variables
+ENV RUST_LOG=info
+ENV RNOSTR_CONFIG_PATH=./config/rnostr.toml
 
-CMD ["relay", "--watch", "-c", "./config/rnostr.toml"]
+# Run the application
+CMD ["./rnostr", "relay", "-c", "./config/rnostr.toml"]

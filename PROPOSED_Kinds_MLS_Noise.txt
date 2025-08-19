@@ -1,0 +1,149 @@
+Nostr Relay Extension: MLS Groups + Noise DMs
+
+This document defines how our custom relay supports MLS-style groups, onboarding, and Noise DMs. It formalizes the event kind assignments, relay rules, and client responsibilities so our team can build consistently.
+
+⸻
+
+Kind Assignments
+
+| Purpose | Kind | Expected tags | Notes |
+|—|—:|—|—|—|
+| KeyPackage (MLS) | 443 | ["p", <owner>], optional cs, kpr, exp, optional h | Advertises MLS KeyPackages. Published by the owner. |
+| Welcome (MLS) | 444 (unsigned, embedded) | none on wire | Lives inside 1059 Giftwrap. Relay treats as opaque. |
+| Group Message (MLS ciphertext) | 445 | ["h", <groupId>], optional k (epoch), optional p (hint) | Opaque MLS ciphertext. Relay delivers only to group members. |
+| Noise Direct Message | 446 | ["p", <recipient>], optional e, optional v=noise.1 | End-to-end Noise DMs. Relay delivers only to recipient. |
+| Giftwrap (onboarding envelope) | 1059 | ["p", <recipient>], ["h", <groupId>], optional v=gift.1 | Wraps an unsigned 444 Welcome for onboarding. |
+
+⸻
+
+Relay Rules
+
+General
+	•	Require NIP-42 auth for publishing gated kinds (443/445/1059).
+	•	Verify signatures, enforce size & rate limits.
+	•	Use selective delivery (only recipients or members get events).
+
+443 — KeyPackages
+	•	Publish: Only allowed if session.pubkey == tag p.
+	•	Visibility: Public to authenticated users (for onboarding). Optional: restrict by h=groupId.
+	•	Expiry: Must not be expired; cap far-future exp.
+	•	Index: (owner, exp desc), (kpr unique).
+
+1059 — Giftwrap (delivers 444 Welcome)
+	•	Publish: Must contain p (recipient) and h (groupId).
+	•	Content: Encrypted blob carrying an unsigned 444 Welcome.
+	•	Delivery: Relay forwards only to p (recipient). Hidden from others.
+
+445 — MLS Group Message
+	•	Publish: Must contain h=groupId. Sender must be a current member.
+	•	Delivery: Only to current members of the group (optionally narrowed by p).
+	•	Index: (groupId, created_at desc).
+
+446 — Noise Direct Message
+	•	Publish: Must contain p=recipient.
+	•	Delivery: Selective: only to recipient (and store for later fetch).
+
+444 — Welcome (inside 1059)
+	•	Never appears as a top-level event. Relays treat it as an opaque payload.
+
+⸻
+
+Membership Management
+
+Since 444 is unsigned and encapsulated, the relay still needs to know who belongs to a group:
+	•	Option 1 (sidecar/ACL): Membership is tracked by a sidecar service or admin API.
+	•	Option 2 (implicit from 1059): When a Giftwrap (1059) for p=invitee arrives, relay marks invitee as a member of h=groupId.
+	•	Option 3 (future roster kind): Add a signed roster kind later (not required now).
+
+For now, Option 1 is simplest and recommended.
+
+⸻
+
+Onboarding Flow
+	1.	Invitee publishes KPs (443).
+	2.	Inviter fetches KP via filter on #p=invitee.
+	3.	Inviter constructs MLS Welcome (444) locally.
+	4.	Inviter publishes 1059 Giftwrap with p=invitee, h=groupId, content=encrypted(444).
+	5.	Relay delivers 1059 only to invitee.
+	6.	Relay/sidecar marks invitee as group member.
+	7.	Invitee starts receiving 445 group messages.
+
+⸻
+
+Wire Examples
+
+443 KeyPackage
+
+["EVENT", {
+  "kind": 443,
+  "pubkey": "<owner>",
+  "tags": [["p","<owner>"],["cs","MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519"],["kpr","kpref_..."],["exp","1726640000"]],
+  "content": "base64(KeyPackageBytes)",
+  "sig": "…"
+}]
+
+1059 Giftwrap
+
+["EVENT", {
+  "kind": 1059,
+  "pubkey": "<inviter>",
+  "tags": [["p","<invitee>"],["h","grp_abc"],["v","gift.1"]],
+  "content": "base64(ciphertext{unsigned kind-444 Welcome})",
+  "sig": "…"
+}]
+
+445 Group Message
+
+["EVENT", {
+  "kind": 445,
+  "pubkey": "<member>",
+  "tags": [["h","grp_abc"],["k","42"]],
+  "content": "base64(mls_ciphertext)",
+  "sig": "…"
+}]
+
+446 Noise DM
+
+["EVENT", {
+  "kind": 446,
+  "pubkey": "<sender>",
+  "tags": [["p","<recipient>"],["v","noise.1"]],
+  "content": "base64(noise_ciphertext)",
+  "sig": "…"
+}]
+
+
+⸻
+
+NIP-11 Advertise
+
+Relay should advertise its capabilities in / info:
+
+{
+  "name": "MyHybridRelay",
+  "supported_nips": [1,11,12,20,33,42],
+  "software": "my-relay/0.3.0",
+  "version": "0.3.0",
+  "extensions": {
+    "mlsGroups": {
+      "kinds": [443,445,1059],
+      "welcome": "embedded-kind-444",
+      "privacy": "membership-gated-445"
+    },
+    "noiseDM": { "kind": 446, "version": "noise.1" }
+  }
+}
+
+
+⸻
+
+Team Checklist
+	•	Implement relay support for kinds 443, 445, 446, 1059.
+	•	Add selective delivery rules (recipient/member-only).
+	•	Decide membership source (sidecar vs implicit 1059).
+	•	Expose NIP-11 extensions.
+	•	Add rate-limits and expiry checks.
+
+⸻
+
+This spec is the baseline for our relay + client implementation of MLS groups and Noise DMs.

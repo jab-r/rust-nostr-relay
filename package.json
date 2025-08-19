@@ -1,0 +1,24 @@
+{
+  "name": "rust-nostr-relay",
+  "version": "1.0.0",
+  "description": "A vendored deployment of [rnostr](https://github.com/rnostr/rnostr) enhanced with MLS Gateway Extension for high-security MLS-over-Nostr messaging. Designed to replace loxation-messaging infrastructure on Google Cloud Run.",
+  "main": "test-websocket.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jab-r/rust-nostr-relay.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/jab-r/rust-nostr-relay/issues"
+  },
+  "homepage": "https://github.com/jab-r/rust-nostr-relay#readme",
+  "dependencies": {
+    "ws": "^8.18.3"
+  }
+}

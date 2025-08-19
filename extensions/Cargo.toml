@@ -25,13 +25,26 @@ actix-web = "4.9.0"
 parking_lot = "0.12.3"
 tracing = "0.1.40"
 governor = { version = "0.6.3", optional = true }
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "macros", "chrono", "uuid"], optional = true }
+tokio = { version = "1", features = ["full"] }
+chrono = { version = "0.4", features = ["serde"] }
+base64 = "0.22.1"
+anyhow = "1.0.86"
+hex = "0.4.3"
+firestore = { version = "0.47", optional = true }
+futures = { version = "0.3", optional = true }
+reqwest = { version = "0.11", features = ["json"], optional = true }
+async-trait = "0.1"
 
 [features]
-default = ["metrics", "rate_limiter", "count", "search"]
+default = ["metrics", "rate_limiter", "count", "search", "mls_gateway"]
 search = ["nostr-relay/search"]
 metrics = ["metrics-exporter-prometheus", "metrics-util"]
 rate_limiter = ["governor"]
 count = []
+mls_gateway = ["mls_gateway_firestore"]
+mls_gateway_sql = ["sqlx"]
+mls_gateway_firestore = ["firestore", "futures", "reqwest"]
 
 [dev-dependencies]
 actix-rt = "2.10.0"
