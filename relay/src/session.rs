@@ -200,10 +200,11 @@ impl Actor for Session {
                     Ok(res) => {
                         act.id = res;
                         act.app.clone().extensions.read().call_connected(act, ctx);
-                        debug!("Session started {} {}", act.id, act.ip);
+                        info!("🔌 WebSocket client connected from {} - Session ID: {}", act.ip, act.id);
                     }
                     // something is wrong with server
-                    _ => {
+                    Err(err) => {
+                        error!("❌ Failed to register session for client {}: {}", act.ip, err);
                         counter!("nostr_relay_session_stop_total", "reason" => "server error")
                             .increment(1);
                         ctx.stop()
@@ -227,7 +228,7 @@ impl Actor for Session {
             .extensions
             .read()
             .call_disconnected(self, ctx);
-        debug!("Session stopped {} {}", self.id, self.ip);
+        info!("🔌 WebSocket client disconnected from {} - Session ID: {}", self.ip, self.id);
     }
 }
 

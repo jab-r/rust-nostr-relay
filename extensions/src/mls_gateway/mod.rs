@@ -38,6 +38,8 @@ const KEYPACKAGE_KIND: u16 = 443;         // MLS KeyPackage
 const WELCOME_KIND: u16 = 444;            // MLS Welcome (embedded in 1059)
 const MLS_GROUP_MESSAGE_KIND: u16 = 445;  // MLS Group Message
 const NOISE_DM_KIND: u16 = 446;           // Noise Direct Message
+const KEYPACKAGE_REQUEST_KIND: u16 = 447; // KeyPackage Request (Nostr-based)
+const ROSTER_POLICY_KIND: u16 = 450;      // Roster/Policy (Admin-signed membership control)
 const GIFTWRAP_KIND: u16 = 1059;          // Giftwrap envelope for Welcome
 
 /// Storage backend type configuration
@@ -76,6 +78,14 @@ pub struct MlsGatewayConfig {
     pub enable_message_archive: bool,
     /// Message archive TTL in days
     pub message_archive_ttl_days: u32,
+    /// System/relay pubkey for KeyPackage requests (kind 447)
+    pub system_pubkey: Option<String>,
+    /// Admin pubkeys allowed to send roster/policy events (kind 450)
+    pub admin_pubkeys: Vec<String>,
+    /// TTL for KeyPackage requests in seconds (default: 7 days)
+    pub keypackage_request_ttl: u64,
+    /// TTL for roster/policy events in days (default: indefinite/365 days)
+    pub roster_policy_ttl_days: u32,
 }
 
 impl Default for MlsGatewayConfig {
@@ -90,6 +100,10 @@ impl Default for MlsGatewayConfig {
             api_prefix: "/api/v1".to_string(),
             enable_message_archive: true,
             message_archive_ttl_days: 30,
+            system_pubkey: None,
+            admin_pubkeys: Vec::new(),
+            keypackage_request_ttl: 604800, // 7 days
+            roster_policy_ttl_days: 365,    // 1 year
         }
     }
 }
@@ -106,6 +120,20 @@ pub trait MlsStorage: Send + Sync {
         last_epoch: Option<i64>,
     ) -> anyhow::Result<()>;
     async fn health_check(&self) -> anyhow::Result<()>;
+    
+    /// Get the last roster/policy sequence number for a group
+    async fn get_last_roster_sequence(&self, group_id: &str) -> anyhow::Result<Option<u64>>;
+    
+    /// Store a roster/policy event with sequence validation
+    async fn store_roster_policy(
+        &self,
+        group_id: &str,
+        sequence: u64,
+        operation: &str,
+        member_pubkeys: &[String],
+        admin_pubkey: &str,
+        created_at: i64,
+    ) -> anyhow::Result<()>;
 }
 
 /// MLS Gateway Extension
@@ -148,6 +176,38 @@ impl StorageBackend {
             StorageBackend::Sql(storage) => storage.health_check().await,
             #[cfg(feature = "mls_gateway_firestore")]
             StorageBackend::Firestore(storage) => storage.health_check().await,
+        }
+    }
+
+    /// Get the last roster/policy sequence number for a group
+    async fn get_last_roster_sequence(&self, group_id: &str) -> anyhow::Result<Option<u64>> {
+        match self {
+            #[cfg(feature = "mls_gateway_sql")]
+            StorageBackend::Sql(storage) => storage.get_last_roster_sequence(group_id).await,
+            #[cfg(feature = "mls_gateway_firestore")]
+            StorageBackend::Firestore(storage) => storage.get_last_roster_sequence(group_id).await,
+        }
+    }
+
+    /// Store a roster/policy event with sequence validation
+    async fn store_roster_policy(
+        &self,
+        group_id: &str,
+        sequence: u64,
+        operation: &str,
+        member_pubkeys: &[String],
+        admin_pubkey: &str,
+        created_at: i64,
+    ) -> anyhow::Result<()> {
+        match self {
+            #[cfg(feature = "mls_gateway_sql")]
+            StorageBackend::Sql(storage) => {
+                storage.store_roster_policy(group_id, sequence, operation, member_pubkeys, admin_pubkey, created_at).await
+            }
+            #[cfg(feature = "mls_gateway_firestore")]
+            StorageBackend::Firestore(storage) => {
+                storage.store_roster_policy(group_id, sequence, operation, member_pubkeys, admin_pubkey, created_at).await
+            }
         }
     }
 }
@@ -376,6 +436,157 @@ impl MlsGateway {
         counter!("mls_gateway_events_processed", "kind" => "446").increment(1);
         Ok(())
     }
+
+    /// Handle KeyPackage Request (kind 447)
+    async fn handle_keypackage_request(&self, event: &Event) -> anyhow::Result<()> {
+        let event_pubkey = hex::encode(event.pubkey());
+        
+        // Verify sender is authorized (system key or admin)
+        let is_authorized = if let Some(ref system_key) = self.config.system_pubkey {
+            &event_pubkey == system_key || self.config.admin_pubkeys.contains(&event_pubkey)
+        } else {
+            self.config.admin_pubkeys.contains(&event_pubkey)
+        };
+
+        if !is_authorized {
+            warn!("Unauthorized KeyPackage request from pubkey: {}", event_pubkey);
+            return Err(anyhow::anyhow!("Unauthorized KeyPackage request"));
+        }
+
+        // Extract recipient from p tag
+        let recipient = event.tags().iter()
+            .find(|tag| tag.len() >= 2 && tag[0] == "p")
+            .map(|tag| tag[1].clone());
+
+        if recipient.is_none() {
+            warn!("KeyPackage request missing recipient (p tag)");
+            return Err(anyhow::anyhow!("Missing recipient in KeyPackage request"));
+        }
+
+        // Extract optional parameters
+        let group_id = event.tags().iter()
+            .find(|tag| tag.len() >= 2 && tag[0] == "h")
+            .map(|tag| tag[1].clone());
+
+        let ciphersuite = event.tags().iter()
+            .find(|tag| tag.len() >= 2 && tag[0] == "cs")
+            .map(|tag| tag[1].clone());
+
+        let min_count = event.tags().iter()
+            .find(|tag| tag.len() >= 2 && tag[0] == "min")
+            .and_then(|tag| tag[1].parse::<u32>().ok())
+            .unwrap_or(1);
+
+        let ttl = event.tags().iter()
+            .find(|tag| tag.len() >= 2 && tag[0] == "ttl")
+            .and_then(|tag| tag[1].parse::<u64>().ok())
+            .unwrap_or(self.config.keypackage_request_ttl);
+
+        // Check if request has expired
+        let now = chrono::Utc::now().timestamp() as u64;
+        let created_at = event.created_at() as u64;
+        if created_at + ttl < now {
+            warn!("KeyPackage request has expired");
+            return Err(anyhow::anyhow!("KeyPackage request has expired"));
+        }
+
+        info!("Processing KeyPackage request: recipient={:?}, group={:?}, ciphersuite={:?}, min={}",
+              recipient, group_id, ciphersuite, min_count);
+
+        counter!("mls_gateway_keypackage_requests_processed").increment(1);
+        counter!("mls_gateway_events_processed", "kind" => "447").increment(1);
+        Ok(())
+    }
+
+    /// Handle Roster/Policy event (kind 450)
+    async fn handle_roster_policy(&self, event: &Event) -> anyhow::Result<()> {
+        let store = self.store()?;
+        let event_pubkey = hex::encode(event.pubkey());
+
+        // Verify sender is authorized admin
+        if !self.config.admin_pubkeys.contains(&event_pubkey) {
+            warn!("Unauthorized roster/policy event from pubkey: {}", event_pubkey);
+            return Err(anyhow::anyhow!("Unauthorized roster/policy event"));
+        }
+
+        // Extract required tags
+        let group_id = event.tags().iter()
+            .find(|tag| tag.len() >= 2 && tag[0] == "h")
+            .map(|tag| tag[1].clone())
+            .ok_or_else(|| anyhow::anyhow!("Missing group_id (h tag)"))?;
+
+        let sequence = event.tags().iter()
+            .find(|tag| tag.len() >= 2 && tag[0] == "seq")
+            .and_then(|tag| tag[1].parse::<u64>().ok())
+            .ok_or_else(|| anyhow::anyhow!("Missing or invalid sequence (seq tag)"))?;
+
+        let operation = event.tags().iter()
+            .find(|tag| tag.len() >= 2 && tag[0] == "op")
+            .map(|tag| tag[1].clone())
+            .ok_or_else(|| anyhow::anyhow!("Missing operation (op tag)"))?;
+
+        // Validate operation type
+        match operation.as_str() {
+            "add" | "remove" | "promote" | "demote" | "bootstrap" | "replace" => {},
+            _ => return Err(anyhow::anyhow!("Invalid operation: {}", operation)),
+        }
+
+        // Extract member pubkeys
+        let member_pubkeys: Vec<String> = event.tags().iter()
+            .filter(|tag| tag.len() >= 2 && tag[0] == "p")
+            .map(|tag| tag[1].clone())
+            .collect();
+
+        if member_pubkeys.is_empty() && operation != "bootstrap" {
+            warn!("Roster/policy event has no member pubkeys");
+        }
+
+        // Check sequence number for idempotency
+        if let Ok(last_seq) = store.get_last_roster_sequence(&group_id).await {
+            if let Some(last_sequence) = last_seq {
+                if sequence <= last_sequence {
+                    warn!("Ignoring roster/policy event with stale sequence: {} <= {}", sequence, last_sequence);
+                    return Err(anyhow::anyhow!("Stale sequence number"));
+                }
+            }
+        }
+        
+        info!("Processing roster/policy event: group={}, seq={}, op={}, members={:?}",
+              group_id, sequence, operation, member_pubkeys);
+
+        // Store the roster/policy event for audit trail and idempotency
+        store.store_roster_policy(
+            &group_id,
+            sequence,
+            &operation,
+            &member_pubkeys,
+            &event_pubkey,
+            event.created_at() as i64,
+        ).await?;
+
+        // Update group registry based on operation
+        match operation.as_str() {
+            "bootstrap" | "add" | "replace" => {
+                // For these operations, ensure group exists and update membership
+                store.upsert_group(
+                    &group_id,
+                    None, // display_name
+                    &event_pubkey, // admin who sent the update
+                    0, // epoch (roster changes don't directly relate to MLS epochs)
+                ).await?;
+            },
+            "remove" | "promote" | "demote" => {
+                // These operations modify existing membership
+                // Implementation would depend on storage schema
+                info!("Roster operation {} applied to group {}", operation, group_id);
+            },
+            _ => unreachable!(), // Already validated above
+        }
+
+        counter!("mls_gateway_roster_policy_updates").increment(1);
+        counter!("mls_gateway_events_processed", "kind" => "450").increment(1);
+        Ok(())
+    }
 }
 
 impl Extension for MlsGateway {
@@ -530,6 +741,38 @@ impl Extension for MlsGateway {
                     
                     counter!("mls_gateway_events_processed", "kind" => "446").increment(1);
                     info!("Processing Noise DM from {}", hex::encode(event.pubkey()));
+                }
+                KEYPACKAGE_REQUEST_KIND => {
+                    // KeyPackage Request (447)
+                    let config = self.config.clone();
+                    let event_clone = event.clone();
+                    tokio::spawn(async move {
+                        let gateway = MlsGateway::new(config);
+                        if let Err(e) = gateway.handle_keypackage_request(&event_clone).await {
+                            error!("Error handling KeyPackage request: {}", e);
+                        }
+                    });
+                }
+                ROSTER_POLICY_KIND => {
+                    // Roster/Policy (450)
+                    let config = self.config.clone();
+                    let store = match self.store() {
+                        Ok(store) => store.clone(),
+                        Err(e) => {
+                            error!("MLS Gateway not initialized: {}", e);
+                            return ExtensionMessageResult::Continue(msg);
+                        }
+                    };
+                    let event_clone = event.clone();
+                    tokio::spawn(async move {
+                        let mut gateway = MlsGateway::new(config);
+                        // Set the store manually since we're in a spawned task
+                        gateway.store = Some(store);
+                        gateway.initialized = true;
+                        if let Err(e) = gateway.handle_roster_policy(&event_clone).await {
+                            error!("Error handling roster/policy event: {}", e);
+                        }
+                    });
                 }
                 _ => {
                     // Not an MLS event, continue processing

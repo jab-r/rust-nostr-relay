@@ -127,4 +127,90 @@ impl MlsStorage for FirestoreStorage {
     async fn health_check(&self) -> anyhow::Result<()> {
         self.health_check().await
     }
+    
+    async fn get_last_roster_sequence(&self, group_id: &str) -> anyhow::Result<Option<u64>> {
+        use firestore::*;
+        
+        let collection_name = "roster_policy";
+        
+        // Query for the latest sequence for this group
+        let query = self.db
+            .fluent()
+            .select()
+            .from(collection_name)
+            .filter(|f| f.field("group_id").eq(group_id))
+            .order_by([
+                FirestoreQueryOrder::new("sequence".to_string(), FirestoreQueryDirection::Descending)
+            ])
+            .limit(1);
+
+        let docs = query.query().await?;
+        let roster_docs: Vec<RosterPolicyDocument> = docs
+            .into_iter()
+            .filter_map(|doc| {
+                // Try to deserialize each document
+                firestore::FirestoreDb::deserialize_doc_to::<RosterPolicyDocument>(&doc).ok()
+            })
+            .collect();
+        
+        Ok(roster_docs.first().map(|doc| doc.sequence))
+    }
+    
+    async fn store_roster_policy(
+        &self,
+        group_id: &str,
+        sequence: u64,
+        operation: &str,
+        member_pubkeys: &[String],
+        admin_pubkey: &str,
+        created_at: i64,
+    ) -> anyhow::Result<()> {
+        let collection = "roster_policy";
+        
+        // Check if sequence already exists for idempotency
+        if let Ok(Some(last_seq)) = self.get_last_roster_sequence(group_id).await {
+            if sequence <= last_seq {
+                return Err(anyhow::anyhow!(
+                    "Invalid sequence: {} <= last sequence {}",
+                    sequence, last_seq
+                ));
+            }
+        }
+        
+        let doc = RosterPolicyDocument {
+            group_id: group_id.to_string(),
+            sequence,
+            operation: operation.to_string(),
+            member_pubkeys: member_pubkeys.to_vec(),
+            admin_pubkey: admin_pubkey.to_string(),
+            created_at,
+            updated_at: chrono::Utc::now().timestamp(),
+        };
+        
+        let doc_id = format!("{}_{}", group_id, sequence);
+        
+        self.db
+            .fluent()
+            .insert()
+            .into(collection)
+            .document_id(&doc_id)
+            .object(&doc)
+            .execute()
+            .await?;
+            
+        info!("Stored roster/policy event: group={}, seq={}, op={}", group_id, sequence, operation);
+        Ok(())
+    }
+}
+
+/// Roster/Policy document structure for Firestore
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RosterPolicyDocument {
+    pub group_id: String,
+    pub sequence: u64,
+    pub operation: String,
+    pub member_pubkeys: Vec<String>,
+    pub admin_pubkey: String,
+    pub created_at: i64,
+    pub updated_at: i64,
 }

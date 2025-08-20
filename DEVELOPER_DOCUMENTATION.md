@@ -104,6 +104,8 @@ sequenceDiagram
 | **444** | MLS Welcome (embedded) | None (inside 1059) | Never appears top-level, treated as opaque |
 | **445** | MLS Group Message | `["h", group_id]`, `["k", epoch]`, `["p", hint]` | Group member-only delivery, registry updates |
 | **446** | Noise Direct Message | `["p", recipient]`, `["v", "noise.1"]` | Recipient-only delivery, E2E encryption |
+| **447** ⭐ | KeyPackage Request | `["p", target]`, `["h", group_id]`, `["cs", ciphersuite]`, `["min", count]`, `["ttl", seconds]` | System/admin only, recipient delivery, cross-relay interop |
+| **450** ⭐ | Roster/Policy Control | `["h", group_id]`, `["seq", number]`, `["op", operation]`, `["p", members...]` | Admin-signed, monotonic sequence, deterministic membership |
 | **1059** | Giftwrap Envelope | `["p", recipient]`, `["h", group_id]`, `["v", "gift.1"]` | Wraps 444 Welcome, membership management |
 
 ### Protocol Implementation Details
@@ -131,7 +133,76 @@ Option 3: Signed roster events (future)
 - Kind 443: Public to authenticated users
 - Kind 445: Group members only (by group_id)
 - Kind 446: Recipient only (by p tag)
+- Kind 447: Recipient only (by p tag), system/admin auth required
+- Kind 450: Group members only, admin auth + sequence validation
 - Kind 1059: Recipient only (by p tag)
+```
+
+#### New Event Kinds Implementation (447 & 450) ⭐
+
+##### KeyPackage Request (Kind 447)
+```rust
+// Purpose: Cross-relay KeyPackage replenishment via Nostr
+// Use case: When relay detects low KeyPackage stock or needs fresh keys
+
+// Example event:
+{
+  "kind": 447,
+  "pubkey": "<relay-system-key>",
+  "created_at": 1724050000,
+  "tags": [
+    ["p", "<target_owner_pubkey>"],     // Required: recipient
+    ["h", "grp_abc123"],                // Optional: group-specific request
+    ["cs", "MLS_128_DHKEMX25519"],      // Optional: ciphersuite hint
+    ["min", "5"],                       // Optional: minimum count requested
+    ["ttl", "604800"]                   // Optional: request expiry (7 days)
+  ],
+  "content": "{\"reason\":\"stock_low\",\"note\":\"Group onboarding spike\"}"
+}
+
+// Security model:
+- Only system_pubkey or admin_pubkeys can publish
+- Recipient-only delivery (no broadcast)
+- Short retention (1-7 days)
+- Rate limiting per publisher
+```
+
+##### Roster/Policy Control (Kind 450)
+```rust
+// Purpose: Deterministic, admin-signed group membership management
+// Use case: Explicit membership control with audit trail and idempotency
+
+// Example event:
+{
+  "kind": 450,
+  "pubkey": "<admin_pubkey>",
+  "created_at": 1724050000,
+  "tags": [
+    ["h", "grp_abc123"],                // Required: group identifier
+    ["seq", "17"],                      // Required: monotonic sequence number
+    ["op", "add"],                      // Required: operation type
+    ["p", "<member1_pubkey>"],          // Repeated: affected members
+    ["p", "<member2_pubkey>"],
+    ["role", "admin"],                  // Optional: role hint for promote/demote
+    ["note", "Onboarding batch"]        // Optional: human context
+  ],
+  "content": "{\"batch_id\":\"onboard_2024_01\"}"
+}
+
+// Operations supported:
+- "add": Add members to group
+- "remove": Remove members from group
+- "promote": Elevate member privileges
+- "demote": Reduce member privileges
+- "bootstrap": Initialize group with member list
+- "replace": Replace entire member list atomically
+
+// Security & Consistency:
+- Only admin_pubkeys for specific group can publish
+- Strictly monotonic sequence numbers per group_id
+- Replay protection via sequence validation
+- Long-term archival for audit/backfill
+- Idempotent processing (duplicate sequences rejected)
 ```
 
 ---
@@ -162,6 +233,23 @@ enable_api = true
 api_prefix = "/api/v1/mls"
 enable_message_archive = true
 message_archive_ttl_days = 30
+
+# New configuration for kinds 447 (KeyPackage Request) and 450 (Roster/Policy)
+# System pubkey for KeyPackage requests (optional - if not set, only admin_pubkeys can request)
+# system_pubkey = "your_system_relay_pubkey_hex"
+
+# Admin pubkeys allowed to send roster/policy events and KeyPackage requests
+admin_pubkeys = [
+    # Add your admin pubkeys here
+    # "admin_pubkey_1_hex",
+    # "admin_pubkey_2_hex"
+]
+
+# TTL for KeyPackage requests in seconds (default: 7 days)
+keypackage_request_ttl = 604800
+
+# TTL for roster/policy events in days (default: 365 days)
+roster_policy_ttl_days = 365
 
 [extensions.mls_gateway.rate_limits]
 max_events_per_minute = 100

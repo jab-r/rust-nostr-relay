@@ -107,6 +107,21 @@ mod sql_storage {
                 )
             "#).execute(&self.pool).await?;
 
+            // Create roster/policy events table
+            sqlx::query(r#"
+                CREATE TABLE IF NOT EXISTS mls_roster_policy (
+                    id TEXT PRIMARY KEY,
+                    group_id TEXT NOT NULL,
+                    sequence BIGINT NOT NULL,
+                    operation TEXT NOT NULL,
+                    member_pubkeys TEXT[] NOT NULL,
+                    admin_pubkey TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE(group_id, sequence)
+                )
+            "#).execute(&self.pool).await?;
+
             // Create indexes for performance
             let indexes = [
                 "CREATE INDEX IF NOT EXISTS idx_mls_keypackages_recipient ON mls_keypackages(recipient_pubkey)",
@@ -114,6 +129,8 @@ mod sql_storage {
                 "CREATE INDEX IF NOT EXISTS idx_mls_welcomes_recipient ON mls_welcomes(recipient_pubkey)",
                 "CREATE INDEX IF NOT EXISTS idx_mls_welcomes_expires ON mls_welcomes(expires_at)",
                 "CREATE INDEX IF NOT EXISTS idx_mls_groups_owner ON mls_groups(owner_pubkey)",
+                "CREATE INDEX IF NOT EXISTS idx_mls_roster_policy_group ON mls_roster_policy(group_id)",
+                "CREATE INDEX IF NOT EXISTS idx_mls_roster_policy_sequence ON mls_roster_policy(group_id, sequence)",
             ];
 
             for index_sql in indexes.iter() {
@@ -159,6 +176,51 @@ mod sql_storage {
 
         async fn health_check(&self) -> anyhow::Result<()> {
             sqlx::query("SELECT 1").fetch_one(&self.pool).await?;
+            Ok(())
+        }
+        
+        async fn get_last_roster_sequence(&self, group_id: &str) -> anyhow::Result<Option<u64>> {
+            let result = sqlx::query!(
+                "SELECT sequence FROM mls_roster_policy WHERE group_id = $1 ORDER BY sequence DESC LIMIT 1",
+                group_id
+            )
+            .fetch_optional(&self.pool)
+            .await?;
+            
+            Ok(result.map(|row| row.sequence as u64))
+        }
+        
+        async fn store_roster_policy(
+            &self,
+            group_id: &str,
+            sequence: u64,
+            operation: &str,
+            member_pubkeys: &[String],
+            admin_pubkey: &str,
+            created_at: i64,
+        ) -> anyhow::Result<()> {
+            let id = format!("{}_{}", group_id, sequence);
+            let created_at_ts = chrono::DateTime::from_timestamp(created_at, 0)
+                .ok_or_else(|| anyhow::anyhow!("Invalid timestamp"))?;
+            
+            let result = sqlx::query!(
+                r#"
+                INSERT INTO mls_roster_policy (id, group_id, sequence, operation, member_pubkeys, admin_pubkey, created_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+                "#,
+                id,
+                group_id,
+                sequence as i64,
+                operation,
+                member_pubkeys,
+                admin_pubkey,
+                created_at_ts
+            )
+            .execute(&self.pool)
+            .await?;
+            
+            info!("Stored roster/policy event: group={}, seq={}, op={} (rows affected: {})",
+                  group_id, sequence, operation, result.rows_affected());
             Ok(())
         }
     }

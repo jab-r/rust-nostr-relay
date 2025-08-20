@@ -4,10 +4,12 @@ const WebSocket = require('ws');
 
 // Test WebSocket connection to the deployed MLS Gateway
 const RELAY_URL = 'wss://loxation-messaging-4dygmq5xta-uc.a.run.app';
+const RELAY_URL1 = 'wss://loxation-messaging-696735170560.us-central1.run.app'
+const RELAY_URL2 = 'wss://messaging.loxation.com';
 
-console.log(`Connecting to MLS Gateway at ${RELAY_URL}...`);
+console.log(`Connecting to MLS Gateway at ${RELAY_URL2}...`);
 
-const ws = new WebSocket(RELAY_URL);
+const ws = new WebSocket(RELAY_URL2);
 
 ws.on('open', () => {
     console.log('✅ WebSocket connection established');
