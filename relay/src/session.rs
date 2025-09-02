@@ -10,7 +10,7 @@ use std::{
     collections::HashMap,
     time::{Duration, Instant},
 };
-use tracing::debug;
+use tracing::{debug, info, error};
 use ws::Message;
 
 pub struct Session {

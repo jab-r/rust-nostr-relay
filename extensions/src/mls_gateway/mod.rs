@@ -120,6 +120,13 @@ pub trait MlsStorage: Send + Sync {
         last_epoch: Option<i64>,
     ) -> anyhow::Result<()>;
     async fn health_check(&self) -> anyhow::Result<()>;
+
+    /// Group-level metadata and authorization helpers
+    async fn group_exists(&self, group_id: &str) -> anyhow::Result<bool>;
+    async fn is_owner(&self, group_id: &str, pubkey: &str) -> anyhow::Result<bool>;
+    async fn is_admin(&self, group_id: &str, pubkey: &str) -> anyhow::Result<bool>;
+    async fn add_admins(&self, group_id: &str, admins: &[String]) -> anyhow::Result<()>;
+    async fn remove_admins(&self, group_id: &str, admins: &[String]) -> anyhow::Result<()>;
     
     /// Get the last roster/policy sequence number for a group
     async fn get_last_roster_sequence(&self, group_id: &str) -> anyhow::Result<Option<u64>>;
@@ -176,6 +183,52 @@ impl StorageBackend {
             StorageBackend::Sql(storage) => storage.health_check().await,
             #[cfg(feature = "mls_gateway_firestore")]
             StorageBackend::Firestore(storage) => storage.health_check().await,
+        }
+    }
+
+    /// Group-level metadata and authorization helpers
+    async fn group_exists(&self, group_id: &str) -> anyhow::Result<bool> {
+        match self {
+            #[cfg(feature = "mls_gateway_sql")]
+            StorageBackend::Sql(storage) => storage.group_exists(group_id).await,
+            #[cfg(feature = "mls_gateway_firestore")]
+            StorageBackend::Firestore(storage) => storage.group_exists(group_id).await,
+        }
+    }
+
+    async fn is_owner(&self, group_id: &str, pubkey: &str) -> anyhow::Result<bool> {
+        match self {
+            #[cfg(feature = "mls_gateway_sql")]
+            StorageBackend::Sql(storage) => storage.is_owner(group_id, pubkey).await,
+            #[cfg(feature = "mls_gateway_firestore")]
+            StorageBackend::Firestore(storage) => storage.is_owner(group_id, pubkey).await,
+        }
+    }
+
+    async fn is_admin(&self, group_id: &str, pubkey: &str) -> anyhow::Result<bool> {
+        match self {
+            #[cfg(feature = "mls_gateway_sql")]
+            StorageBackend::Sql(storage) => storage.is_admin(group_id, pubkey).await,
+            #[cfg(feature = "mls_gateway_firestore")]
+            StorageBackend::Firestore(storage) => storage.is_admin(group_id, pubkey).await,
+        }
+    }
+
+    async fn add_admins(&self, group_id: &str, admins: &[String]) -> anyhow::Result<()> {
+        match self {
+            #[cfg(feature = "mls_gateway_sql")]
+            StorageBackend::Sql(storage) => storage.add_admins(group_id, admins).await,
+            #[cfg(feature = "mls_gateway_firestore")]
+            StorageBackend::Firestore(storage) => storage.add_admins(group_id, admins).await,
+        }
+    }
+
+    async fn remove_admins(&self, group_id: &str, admins: &[String]) -> anyhow::Result<()> {
+        match self {
+            #[cfg(feature = "mls_gateway_sql")]
+            StorageBackend::Sql(storage) => storage.remove_admins(group_id, admins).await,
+            #[cfg(feature = "mls_gateway_firestore")]
+            StorageBackend::Firestore(storage) => storage.remove_admins(group_id, admins).await,
         }
     }
 
@@ -440,17 +493,34 @@ impl MlsGateway {
     /// Handle KeyPackage Request (kind 447)
     async fn handle_keypackage_request(&self, event: &Event) -> anyhow::Result<()> {
         let event_pubkey = hex::encode(event.pubkey());
-        
-        // Verify sender is authorized (system key or admin)
-        let is_authorized = if let Some(ref system_key) = self.config.system_pubkey {
-            &event_pubkey == system_key || self.config.admin_pubkeys.contains(&event_pubkey)
-        } else {
-            self.config.admin_pubkeys.contains(&event_pubkey)
-        };
 
-        if !is_authorized {
-            warn!("Unauthorized KeyPackage request from pubkey: {}", event_pubkey);
-            return Err(anyhow::anyhow!("Unauthorized KeyPackage request"));
+        // Authorization:
+        // If scoped to a group (h tag present), require owner or group admin for that group.
+        // Otherwise, fall back to system/admin allowlist.
+        let scoped_group = event.tags().iter()
+            .find(|tag| tag.len() >= 2 && tag[0] == "h")
+            .map(|tag| tag[1].clone());
+
+        if let Some(group_id) = scoped_group {
+            let store = self.store()?;
+            let is_owner = store.is_owner(&group_id, &event_pubkey).await.unwrap_or(false);
+            let is_admin = store.is_admin(&group_id, &event_pubkey).await.unwrap_or(false);
+            if !(is_owner || is_admin) {
+                warn!("Unauthorized KeyPackage request for group {} from {}", group_id, event_pubkey);
+                return Err(anyhow::anyhow!("Unauthorized KeyPackage request for group"));
+            }
+        } else {
+            // Verify sender is authorized (system key or admin)
+            let is_authorized = if let Some(ref system_key) = self.config.system_pubkey {
+                &event_pubkey == system_key || self.config.admin_pubkeys.contains(&event_pubkey)
+            } else {
+                self.config.admin_pubkeys.contains(&event_pubkey)
+            };
+
+            if !is_authorized {
+                warn!("Unauthorized KeyPackage request from pubkey: {}", event_pubkey);
+                return Err(anyhow::anyhow!("Unauthorized KeyPackage request"));
+            }
         }
 
         // Extract recipient from p tag
@@ -503,27 +573,40 @@ impl MlsGateway {
         let store = self.store()?;
         let event_pubkey = hex::encode(event.pubkey());
 
-        // Verify sender is authorized admin
-        if !self.config.admin_pubkeys.contains(&event_pubkey) {
-            warn!("Unauthorized roster/policy event from pubkey: {}", event_pubkey);
-            return Err(anyhow::anyhow!("Unauthorized roster/policy event"));
-        }
-
         // Extract required tags
         let group_id = event.tags().iter()
             .find(|tag| tag.len() >= 2 && tag[0] == "h")
             .map(|tag| tag[1].clone())
             .ok_or_else(|| anyhow::anyhow!("Missing group_id (h tag)"))?;
 
+        // Determine operation up front (used for auth on non-existent groups)
+        let operation = event.tags().iter()
+            .find(|tag| tag.len() >= 2 && tag[0] == "op")
+            .map(|tag| tag[1].clone())
+            .ok_or_else(|| anyhow::anyhow!("Missing operation (op tag)"))?;
+
+        // Authorization based on per-group ownership/admins
+        let group_exists = store.group_exists(&group_id).await.unwrap_or(false);
+        if !group_exists {
+            // Only allow bootstrap to create a new group; creator becomes owner and initial admin
+            if operation.as_str() != "bootstrap" {
+                warn!("Rejecting non-bootstrap roster event for unknown group {}", group_id);
+                return Err(anyhow::anyhow!("Group does not exist; bootstrap required"));
+            }
+        } else {
+            let is_owner = store.is_owner(&group_id, &event_pubkey).await.unwrap_or(false);
+            let is_admin = store.is_admin(&group_id, &event_pubkey).await.unwrap_or(false);
+            if !(is_owner || is_admin) {
+                warn!("Unauthorized roster/policy event for group {} from {}", group_id, event_pubkey);
+                return Err(anyhow::anyhow!("Unauthorized roster/policy event"));
+            }
+        }
+
         let sequence = event.tags().iter()
             .find(|tag| tag.len() >= 2 && tag[0] == "seq")
             .and_then(|tag| tag[1].parse::<u64>().ok())
             .ok_or_else(|| anyhow::anyhow!("Missing or invalid sequence (seq tag)"))?;
 
-        let operation = event.tags().iter()
-            .find(|tag| tag.len() >= 2 && tag[0] == "op")
-            .map(|tag| tag[1].clone())
-            .ok_or_else(|| anyhow::anyhow!("Missing operation (op tag)"))?;
 
         // Validate operation type
         match operation.as_str() {
@@ -565,21 +648,56 @@ impl MlsGateway {
         ).await?;
 
         // Update group registry based on operation
+        let role_admin = event.tags().iter()
+            .find(|tag| tag.len() >= 2 && tag[0] == "role")
+            .map(|tag| tag[1].to_lowercase())
+            .map(|s| s == "admin")
+            .unwrap_or(false);
+
         match operation.as_str() {
-            "bootstrap" | "add" | "replace" => {
-                // For these operations, ensure group exists and update membership
+            "bootstrap" => {
+                // Create group with sender as owner and initial admin
                 store.upsert_group(
                     &group_id,
-                    None, // display_name
-                    &event_pubkey, // admin who sent the update
-                    0, // epoch (roster changes don't directly relate to MLS epochs)
+                    None,
+                    &event_pubkey,
+                    0,
                 ).await?;
-            },
-            "remove" | "promote" | "demote" => {
-                // These operations modify existing membership
-                // Implementation would depend on storage schema
+                // Ensure creator is an admin
+                store.add_admins(&group_id, &vec![event_pubkey.clone()]).await?;
+                info!("Initialized group {} by owner {}", group_id, event_pubkey);
+            }
+            "add" | "replace" => {
+                // Ensure group record exists and bump updated_at
+                store.upsert_group(
+                    &group_id,
+                    None,
+                    &event_pubkey,
+                    0,
+                ).await?;
                 info!("Roster operation {} applied to group {}", operation, group_id);
-            },
+            }
+            "promote" => {
+                // If role=admin, add listed pubkeys as admins
+                if role_admin && !member_pubkeys.is_empty() {
+                    store.add_admins(&group_id, &member_pubkeys).await?;
+                    info!("Promoted admins in group {}: {:?}", group_id, member_pubkeys);
+                } else {
+                    info!("Roster operation promote applied to group {}", group_id);
+                }
+            }
+            "demote" => {
+                // If role=admin, remove listed pubkeys from admins
+                if role_admin && !member_pubkeys.is_empty() {
+                    store.remove_admins(&group_id, &member_pubkeys).await?;
+                    info!("Demoted admins in group {}: {:?}", group_id, member_pubkeys);
+                } else {
+                    info!("Roster operation demote applied to group {}", group_id);
+                }
+            }
+            "remove" => {
+                info!("Roster operation remove applied to group {}", group_id);
+            }
             _ => unreachable!(), // Already validated above
         }
 
@@ -745,9 +863,18 @@ impl Extension for MlsGateway {
                 KEYPACKAGE_REQUEST_KIND => {
                     // KeyPackage Request (447)
                     let config = self.config.clone();
+                    let store = match self.store() {
+                        Ok(store) => store.clone(),
+                        Err(e) => {
+                            error!("MLS Gateway not initialized: {}", e);
+                            return ExtensionMessageResult::Continue(msg);
+                        }
+                    };
                     let event_clone = event.clone();
                     tokio::spawn(async move {
-                        let gateway = MlsGateway::new(config);
+                        let mut gateway = MlsGateway::new(config);
+                        gateway.store = Some(store);
+                        gateway.initialized = true;
                         if let Err(e) = gateway.handle_keypackage_request(&event_clone).await {
                             error!("Error handling KeyPackage request: {}", e);
                         }

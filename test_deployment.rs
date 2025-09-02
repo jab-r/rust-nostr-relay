@@ -15,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use url::Url;
 
-#[tokio::main]
+#[actix_rt::main]
 async fn main() -> Result<()> {
     println!("🔍 Testing rust-nostr-relay MLS Gateway deployment...");
 
@@ -34,6 +34,9 @@ async fn main() -> Result<()> {
 
     // Test 3: MLS Gateway REST API
     test_api_endpoints(&api_url).await?;
+
+    // Test 3.5: Group creation via roster/policy bootstrap (kind 450)
+    test_group_creation(&relay_url).await?;
 
     // Test 4: MLS Message Processing (if relay is running)
     test_mls_message_processing(&relay_url).await?;
@@ -110,6 +113,69 @@ async fn test_api_endpoints(api_url: &str) -> Result<()> {
     }
     
     println!("✅ API endpoint tests completed");
+    Ok(())
+}
+
+async fn test_group_creation(relay_url: &str) -> Result<()> {
+    println!("\n👥 Testing group creation (roster/policy bootstrap)...");
+
+    // Build a minimal, syntactically valid Nostr event for kind 450 bootstrap
+    // - id: 64-hex
+    // - pubkey: 64-hex
+    // - sig: 128-hex (not verified here)
+    let id_hex = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let owner_pubkey_hex = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let sig_hex = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+    let group_id = format!("grp_integ_{}", now); // unique per run
+    let bootstrap_event = json!({
+        "id": id_hex,
+        "kind": 450,
+        "pubkey": owner_pubkey_hex,
+        "created_at": now,
+        "content": "bootstrap group",
+        "tags": [
+            ["h", group_id],
+            ["seq", "1"],
+            ["op", "bootstrap"],
+            // optional initial members
+            ["p", owner_pubkey_hex]
+        ],
+        "sig": sig_hex
+    });
+
+    let msg = json!(["EVENT", bootstrap_event]);
+
+    let url = Url::parse(relay_url)?;
+    let (mut ws_stream, _) = connect_async(url).await?;
+
+    use futures_util::{SinkExt, StreamExt};
+    ws_stream.send(Message::Text(msg.to_string())).await?;
+
+    // Attempt to read an OK notice back from the relay (best-effort)
+    // Server typically replies with ["OK", "<event_id>", true/false, "<message>"]
+    // Give it up to 2 seconds.
+    let maybe_resp = actix_rt::time::timeout(std::time::Duration::from_secs(2), ws_stream.next()).await;
+    match maybe_resp {
+        Ok(Some(Ok(Message::Text(txt)))) => {
+            println!("✅ Bootstrap event sent. Relay response: {}", txt);
+        }
+        Ok(Some(Ok(_other))) => {
+            println!("✅ Bootstrap event sent. Relay responded with non-text frame");
+        }
+        Ok(Some(Err(e))) => {
+            println!("⚠️  Bootstrap response error: {}", e);
+        }
+        Ok(None) => {
+            println!("⚠️  No response from relay after sending bootstrap event");
+        }
+        Err(_) => {
+            println!("⚠️  Timed out waiting for relay response to bootstrap event");
+        }
+    }
+
+    println!("✅ Group creation test completed (check relay logs for roster/policy handling)");
     Ok(())
 }
 

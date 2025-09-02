@@ -21,8 +21,19 @@ pub struct GroupInfo {
     pub display_name: Option<String>,
     pub owner_pubkey: String,
     pub last_epoch: Option<i64>,
+    #[serde(default)]
+    pub admin_pubkeys: Vec<String>,
     #[serde(with = "chrono::serde::ts_seconds")]
     pub created_at: DateTime<Utc>,
+    #[serde(with = "chrono::serde::ts_seconds")]
+    pub updated_at: DateTime<Utc>,
+}
+
+///// Helper struct for partial admin updates
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AdminsPatch {
+    #[serde(default)]
+    pub admin_pubkeys: Vec<String>,
     #[serde(with = "chrono::serde::ts_seconds")]
     pub updated_at: DateTime<Utc>,
 }
@@ -57,6 +68,27 @@ impl FirestoreStorage {
         Ok(())
     }
 
+    /// Fetch a group document by ID
+    pub async fn fetch_group(&self, group_id: &str) -> Result<Option<GroupInfo>> {
+        let docs = self.db
+            .fluent()
+            .select()
+            .from("mls_groups")
+            .filter(|f| f.field("group_id").eq(group_id))
+            .limit(1)
+            .query()
+            .await?;
+
+        let mut groups: Vec<GroupInfo> = docs
+            .into_iter()
+            .filter_map(|doc| {
+                firestore::FirestoreDb::deserialize_doc_to::<GroupInfo>(&doc).ok()
+            })
+            .collect();
+
+        Ok(groups.pop())
+    }
+
     /// Upsert group information in the registry
     #[instrument(skip(self))]
     pub async fn upsert_group(
@@ -67,13 +99,22 @@ impl FirestoreStorage {
         last_epoch: i64,
     ) -> Result<()> {
         let now = Utc::now();
-        
+
+        // Preserve existing owner and created_at if the group already exists
+        let existing = self.fetch_group(group_id).await?;
+        let (owner_val, created_at_val, existing_admins, existing_display_name, existing_last_epoch) = if let Some(g) = existing {
+            (g.owner_pubkey, g.created_at, g.admin_pubkeys, g.display_name, g.last_epoch)
+        } else {
+            (owner_pubkey.to_string(), now, Vec::new(), None, None)
+        };
+
         let group = GroupInfo {
             group_id: group_id.to_string(),
-            display_name: display_name.map(|s| s.to_string()),
-            owner_pubkey: owner_pubkey.to_string(),
-            last_epoch: Some(last_epoch),
-            created_at: now,
+            display_name: display_name.map(|s| s.to_string()).or(existing_display_name),
+            owner_pubkey: owner_val,
+            last_epoch: Some(last_epoch).or(existing_last_epoch),
+            admin_pubkeys: existing_admins,
+            created_at: created_at_val,
             updated_at: now,
         };
 
@@ -81,7 +122,7 @@ impl FirestoreStorage {
         self.db
             .fluent()
             .update()
-            .fields(paths!(GroupInfo::{group_id, display_name, owner_pubkey, last_epoch, created_at, updated_at}))
+            .fields(paths!(GroupInfo::{group_id, display_name, owner_pubkey, last_epoch, admin_pubkeys, created_at, updated_at}))
             .in_col("mls_groups")
             .document_id(group_id)
             .object(&group)
@@ -126,6 +167,66 @@ impl MlsStorage for FirestoreStorage {
     
     async fn health_check(&self) -> anyhow::Result<()> {
         self.health_check().await
+    }
+
+    async fn group_exists(&self, group_id: &str) -> anyhow::Result<bool> {
+        let docs = self.db
+            .fluent()
+            .select()
+            .from("mls_groups")
+            .filter(|f| f.field("group_id").eq(group_id))
+            .limit(1)
+            .query()
+            .await?;
+        Ok(!docs.is_empty())
+    }
+
+    async fn is_owner(&self, group_id: &str, pubkey: &str) -> anyhow::Result<bool> {
+        let group = self.fetch_group(group_id).await?;
+        Ok(group.map_or(false, |g| g.owner_pubkey == pubkey))
+    }
+
+    async fn is_admin(&self, group_id: &str, pubkey: &str) -> anyhow::Result<bool> {
+        let group = self.fetch_group(group_id).await?;
+        Ok(group.map_or(false, |g| g.admin_pubkeys.iter().any(|p| p == pubkey)))
+    }
+
+    async fn add_admins(&self, group_id: &str, admins: &[String]) -> anyhow::Result<()> {
+        let now = Utc::now();
+        let mut current = self.fetch_group(group_id).await?.map(|g| g.admin_pubkeys).unwrap_or_default();
+        for a in admins {
+            if !current.iter().any(|x| x == a) {
+                current.push(a.clone());
+            }
+        }
+        let patch = AdminsPatch { admin_pubkeys: current, updated_at: now };
+        self.db
+            .fluent()
+            .update()
+            .fields(paths!(AdminsPatch::{admin_pubkeys, updated_at}))
+            .in_col("mls_groups")
+            .document_id(group_id)
+            .object(&patch)
+            .execute()
+            .await?;
+        Ok(())
+    }
+
+    async fn remove_admins(&self, group_id: &str, admins: &[String]) -> anyhow::Result<()> {
+        let now = Utc::now();
+        let mut current = self.fetch_group(group_id).await?.map(|g| g.admin_pubkeys).unwrap_or_default();
+        current.retain(|p| !admins.iter().any(|a| a == p));
+        let patch = AdminsPatch { admin_pubkeys: current, updated_at: now };
+        self.db
+            .fluent()
+            .update()
+            .fields(paths!(AdminsPatch::{admin_pubkeys, updated_at}))
+            .in_col("mls_groups")
+            .document_id(group_id)
+            .object(&patch)
+            .execute()
+            .await?;
+        Ok(())
     }
     
     async fn get_last_roster_sequence(&self, group_id: &str) -> anyhow::Result<Option<u64>> {
