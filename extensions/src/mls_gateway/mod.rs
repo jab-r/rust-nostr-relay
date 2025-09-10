@@ -21,7 +21,7 @@ pub mod firestore;
 pub use firestore::FirestoreStorage;
 
 #[cfg(feature = "mls_gateway_sql")]
-pub use storage::CloudSqlStore;
+pub use storage::SqlStorage;
 
 pub use message_archive::MessageArchive;
 
@@ -171,7 +171,7 @@ impl StorageBackend {
     ) -> anyhow::Result<()> {
         match self {
             #[cfg(feature = "mls_gateway_sql")]
-            StorageBackend::Sql(storage) => storage.upsert_group(group_id, display_name, creator_pubkey, epoch).await,
+            StorageBackend::Sql(storage) => storage.upsert_group(group_id, display_name, creator_pubkey, Some(epoch as i64)).await,
             #[cfg(feature = "mls_gateway_firestore")]
             StorageBackend::Firestore(storage) => storage.upsert_group(group_id, display_name, creator_pubkey, epoch as i64).await,
         }
@@ -312,7 +312,7 @@ impl MlsGateway {
             },
             #[cfg(feature = "mls_gateway_sql")]
             StorageType::CloudSql => {
-                let pool = match &self.config.sql_url {
+                let pool = match &self.config.database_url {
                     Some(url) => {
                         info!("Connecting to SQL database at {}", url);
                         sqlx::postgres::PgPoolOptions::new()
@@ -329,7 +329,7 @@ impl MlsGateway {
             }
         };
 
-        // Initialize message archive if enabled and using Firestore
+        // Initialize message archive if enabled
         let message_archive = if self.config.enable_message_archive {
             match &self.config.storage_backend {
                 #[cfg(feature = "mls_gateway_firestore")]
@@ -344,6 +344,11 @@ impl MlsGateway {
                             None
                         }
                     }
+                }
+                #[cfg(feature = "mls_gateway_sql")]
+                StorageType::CloudSql => {
+                    info!("Message archival not yet supported for SQL backend; disabling");
+                    None
                 }
             }
         } else {

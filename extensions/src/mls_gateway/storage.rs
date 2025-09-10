@@ -6,11 +6,10 @@
 
 #[cfg(feature = "mls_gateway_sql")]
 mod sql_storage {
-    use sqlx::{PgPool, Row, postgres::PgRow};
-    use chrono::{DateTime, Utc, Duration};
+    use sqlx::PgPool;
+    use chrono::{DateTime, Utc};
     use serde::{Deserialize, Serialize};
-    use tracing::{info, warn, instrument};
-    use uuid::Uuid;
+    use tracing::{info, warn};
     use anyhow::Result;
     use async_trait::async_trait;
     use crate::mls_gateway::MlsStorage;
@@ -60,12 +59,12 @@ mod sql_storage {
         /// Create new SQL storage instance
         pub async fn new(pool: PgPool) -> Result<Self> {
             let storage = Self { pool };
-            storage.migrate().await?;
+            storage.run_migrations().await?;
             Ok(storage)
         }
 
         /// Run database migrations
-        async fn migrate(&self) -> Result<()> {
+        async fn run_migrations(&self) -> Result<()> {
             info!("Running SQL database migrations...");
             
             // Create groups table
@@ -75,6 +74,7 @@ mod sql_storage {
                     display_name TEXT,
                     owner_pubkey TEXT NOT NULL,
                     last_epoch BIGINT,
+                    admin_pubkeys TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
@@ -145,7 +145,7 @@ mod sql_storage {
     #[async_trait]
     impl MlsStorage for SqlStorage {
         async fn migrate(&self) -> anyhow::Result<()> {
-            self.migrate().await
+            self.run_migrations().await
         }
 
         async fn upsert_group(
@@ -155,12 +155,14 @@ mod sql_storage {
             creator_pubkey: &str,
             last_epoch: Option<i64>,
         ) -> anyhow::Result<()> {
+            // Preserve existing owner_pubkey, created_at, and admin_pubkeys on update.
+            // Only update display_name/last_epoch when provided (COALESCE to retain existing when NULL).
             let result = sqlx::query(r#"
-                INSERT INTO mls_groups (group_id, display_name, owner_pubkey, last_epoch, created_at, updated_at)
-                VALUES ($1, $2, $3, $4, NOW(), NOW())
+                INSERT INTO mls_groups (group_id, display_name, owner_pubkey, last_epoch)
+                VALUES ($1, $2, $3, $4)
                 ON CONFLICT (group_id) DO UPDATE SET
-                    display_name = EXCLUDED.display_name,
-                    last_epoch = EXCLUDED.last_epoch,
+                    display_name = COALESCE(EXCLUDED.display_name, mls_groups.display_name),
+                    last_epoch = COALESCE(EXCLUDED.last_epoch, mls_groups.last_epoch),
                     updated_at = NOW()
             "#)
             .bind(group_id)
@@ -178,16 +180,100 @@ mod sql_storage {
             sqlx::query("SELECT 1").fetch_one(&self.pool).await?;
             Ok(())
         }
-        
-        async fn get_last_roster_sequence(&self, group_id: &str) -> anyhow::Result<Option<u64>> {
-            let result = sqlx::query!(
-                "SELECT sequence FROM mls_roster_policy WHERE group_id = $1 ORDER BY sequence DESC LIMIT 1",
-                group_id
+
+        async fn group_exists(&self, group_id: &str) -> anyhow::Result<bool> {
+            let exists = sqlx::query_scalar::<_, i64>(
+                "SELECT 1 FROM mls_groups WHERE group_id = $1 LIMIT 1"
             )
+            .bind(group_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .is_some();
+            Ok(exists)
+        }
+
+        async fn is_owner(&self, group_id: &str, pubkey: &str) -> anyhow::Result<bool> {
+            let owner: Option<String> = sqlx::query_scalar(
+                "SELECT owner_pubkey FROM mls_groups WHERE group_id = $1"
+            )
+            .bind(group_id)
             .fetch_optional(&self.pool)
             .await?;
-            
-            Ok(result.map(|row| row.sequence as u64))
+            Ok(owner.map_or(false, |o| o == pubkey))
+        }
+
+        async fn is_admin(&self, group_id: &str, pubkey: &str) -> anyhow::Result<bool> {
+            let is_admin: Option<bool> = sqlx::query_scalar(
+                "SELECT $2 = ANY(admin_pubkeys) FROM mls_groups WHERE group_id = $1"
+            )
+            .bind(group_id)
+            .bind(pubkey)
+            .fetch_optional(&self.pool)
+            .await?;
+            Ok(is_admin.unwrap_or(false))
+        }
+
+        async fn add_admins(&self, group_id: &str, admins: &[String]) -> anyhow::Result<()> {
+            let mut tx = self.pool.begin().await?;
+            let current: Option<Vec<String>> = sqlx::query_scalar(
+                "SELECT admin_pubkeys FROM mls_groups WHERE group_id = $1 FOR UPDATE"
+            )
+            .bind(group_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+
+            let mut new_list = current.unwrap_or_default();
+            for a in admins {
+                if !new_list.iter().any(|x| x == a) {
+                    new_list.push(a.clone());
+                }
+            }
+
+            sqlx::query(
+                "UPDATE mls_groups SET admin_pubkeys = $2, updated_at = NOW() WHERE group_id = $1"
+            )
+            .bind(group_id)
+            .bind(&new_list)
+            .execute(&mut *tx)
+            .await?;
+
+            tx.commit().await?;
+            Ok(())
+        }
+
+        async fn remove_admins(&self, group_id: &str, admins: &[String]) -> anyhow::Result<()> {
+            let mut tx = self.pool.begin().await?;
+            let current: Option<Vec<String>> = sqlx::query_scalar(
+                "SELECT admin_pubkeys FROM mls_groups WHERE group_id = $1 FOR UPDATE"
+            )
+            .bind(group_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+
+            let mut new_list = current.unwrap_or_default();
+            new_list.retain(|p| !admins.iter().any(|a| a == p));
+
+            sqlx::query(
+                "UPDATE mls_groups SET admin_pubkeys = $2, updated_at = NOW() WHERE group_id = $1"
+            )
+            .bind(group_id)
+            .bind(&new_list)
+            .execute(&mut *tx)
+            .await?;
+
+            tx.commit().await?;
+            Ok(())
+        }
+        
+        async fn get_last_roster_sequence(&self, group_id: &str) -> anyhow::Result<Option<u64>> {
+            let seq_opt: Option<i64> = sqlx::query_scalar(
+                "SELECT sequence FROM mls_roster_policy WHERE group_id = $1 ORDER BY sequence DESC LIMIT 1"
+            )
+            .bind(group_id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+            Ok(seq_opt.map(|s| s as u64))
         }
         
         async fn store_roster_policy(
@@ -203,19 +289,19 @@ mod sql_storage {
             let created_at_ts = chrono::DateTime::from_timestamp(created_at, 0)
                 .ok_or_else(|| anyhow::anyhow!("Invalid timestamp"))?;
             
-            let result = sqlx::query!(
+            let result = sqlx::query(
                 r#"
                 INSERT INTO mls_roster_policy (id, group_id, sequence, operation, member_pubkeys, admin_pubkey, created_at, updated_at)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-                "#,
-                id,
-                group_id,
-                sequence as i64,
-                operation,
-                member_pubkeys,
-                admin_pubkey,
-                created_at_ts
+                "#
             )
+            .bind(&id)
+            .bind(group_id)
+            .bind(sequence as i64)
+            .bind(operation)
+            .bind(member_pubkeys)
+            .bind(admin_pubkey)
+            .bind(created_at_ts)
             .execute(&self.pool)
             .await?;
             
