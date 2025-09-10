@@ -35,9 +35,14 @@ firestore = { version = "0.47", optional = true }
 futures = { version = "0.3", optional = true }
 reqwest = { version = "0.11", features = ["json"], optional = true }
 async-trait = "0.1"
+hmac = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+once_cell = "1.19.0"
+# Optional RN MLS crate for service-member decrypt/dispatch (MLS-first NIP-SERVICE path)
 
 [features]
-default = ["metrics", "rate_limiter", "count", "search", "mls_gateway"]
+default = ["metrics", "rate_limiter", "count", "search", "mls_gateway", "nip_service"]
 search = ["nostr-relay/search"]
 metrics = ["metrics-exporter-prometheus", "metrics-util"]
 rate_limiter = ["governor"]
@@ -45,6 +50,9 @@ count = []
 mls_gateway = ["mls_gateway_firestore"]
 mls_gateway_sql = ["sqlx"]
 mls_gateway_firestore = ["firestore", "futures", "reqwest"]
+nip_service = []
+# Enable MLS-first NIP-SERVICE path (decrypt kind 445 via RN MLS; optional)
+nip_service_mls = []
 
 [dev-dependencies]
 actix-rt = "2.10.0"

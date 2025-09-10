@@ -17,6 +17,9 @@ pub mod message_archive;
 #[cfg(feature = "mls_gateway_firestore")]
 pub mod firestore;
 
+#[cfg(feature = "nip_service_mls")]
+pub mod service_member;
+
 #[cfg(feature = "mls_gateway_firestore")]
 pub use firestore::FirestoreStorage;
 
@@ -86,6 +89,15 @@ pub struct MlsGatewayConfig {
     pub keypackage_request_ttl: u64,
     /// TTL for roster/policy events in days (default: indefinite/365 days)
     pub roster_policy_ttl_days: u32,
+
+    /// Enable in-process MLS decrypt/dispatch for service actions
+    pub enable_in_process_decrypt: bool,
+    /// Select the active handler for service actions: "in-process" or "external"
+    pub preferred_service_handler: String,
+    /// Optional policy hint: if true, skip attempt when registry does not mark service-enabled
+    pub gating_use_registry_hint: bool,
+    /// MLS service-member user identifier used for membership checks
+    pub mls_service_user_id: Option<String>,
 }
 
 impl Default for MlsGatewayConfig {
@@ -104,6 +116,10 @@ impl Default for MlsGatewayConfig {
             admin_pubkeys: Vec::new(),
             keypackage_request_ttl: 604800, // 7 days
             roster_policy_ttl_days: 365,    // 1 year
+            enable_in_process_decrypt: true,
+            preferred_service_handler: "in-process".to_string(),
+            gating_use_registry_hint: false,
+            mls_service_user_id: None,
         }
     }
 }
@@ -842,7 +858,7 @@ impl Extension for MlsGateway {
                             }
                         }
 
-                        if let Err(e) = Self::handle_mls_group_message_static(store, &event_clone).await {
+                        if let Err(e) = Self::handle_mls_group_message_static(store, config.clone(), &event_clone).await {
                             error!("Error handling MLS group message: {}", e);
                         }
                     });
@@ -918,9 +934,9 @@ impl Extension for MlsGateway {
 
 impl MlsGateway {
     /// Static version of handle_mls_group_message for use in async context
-    async fn handle_mls_group_message_static(store: StorageBackend, event: &Event) -> anyhow::Result<()> {
+    async fn handle_mls_group_message_static(store: StorageBackend, config: MlsGatewayConfig, event: &Event) -> anyhow::Result<()> {
         // Extract group ID and epoch from tags
-        let group_id = event.tags().iter()
+        let group_id_opt = event.tags().iter()
             .find(|tag| tag.len() >= 2 && tag[0] == "h")
             .map(|tag| tag[1].clone());
             
@@ -928,10 +944,10 @@ impl MlsGateway {
             .find(|tag| tag.len() >= 2 && tag[0] == "k")
             .and_then(|tag| tag[1].parse::<i64>().ok());
 
-        if let Some(group_id) = group_id {
+        if let Some(ref group_id) = group_id_opt {
             // Update group registry
             store.upsert_group(
-                &group_id,
+                group_id,
                 None, // display_name from content if needed
                 &hex::encode(event.pubkey()),
                 epoch.unwrap_or(0) as u64,
@@ -939,6 +955,58 @@ impl MlsGateway {
             
             counter!("mls_gateway_groups_updated").increment(1);
             info!("Updated group registry for group: {}", group_id);
+        }
+
+        // Membership-first gating for MLS-first decrypt/dispatch
+        #[cfg(feature = "nip_service_mls")]
+        if let Some(ref group_id) = group_id_opt {
+            // 1) Handler selection and global enable
+            if !config.enable_in_process_decrypt || config.preferred_service_handler.to_lowercase() != "in-process" {
+                counter!("mls_gateway_events_processed", "kind" => "445_nip_service_handler_disabled").increment(1);
+            } else {
+                // 2) Optional registry hint prefilter (policy/ops only)
+                let mut allowed = true;
+                if config.gating_use_registry_hint {
+                    #[cfg(feature = "mls_gateway_firestore")]
+                    {
+                        let is_service_enabled = match &store {
+                            StorageBackend::Firestore(storage) => storage.has_service_member(group_id).await.unwrap_or(false),
+                            #[cfg(feature = "mls_gateway_sql")]
+                            StorageBackend::Sql(_storage) => false,
+                        };
+                        if !is_service_enabled {
+                            counter!("mls_gateway_events_processed", "kind" => "445_nip_service_policy_hint_skip").increment(1);
+                            allowed = false;
+                        }
+                    }
+                    #[cfg(not(feature = "mls_gateway_firestore"))]
+                    {
+                        // No registry available; ignore hint
+                    }
+                }
+
+                // 3) Membership-first gating (fast in-memory)
+                if allowed {
+                    if let Some(user_id) = config.mls_service_user_id.as_deref() {
+                        if crate::mls_gateway::service_member::has_group(user_id, group_id) {
+                            // Try to decrypt via service member (dev stub for now)
+                            if let Some(json) = crate::mls_gateway::service_member::try_decrypt_service_request(event).await {
+                                // Dispatch decrypted NIP-SERVICE payload without exposing plaintext outside this scope
+                                crate::nip_service::dispatcher::handle_service_request_payload(&json, Some(group_id.as_str()));
+                                counter!("mls_gateway_events_processed", "kind" => "445_nip_service_decrypted").increment(1);
+                            } else {
+                                // Not a NIP-SERVICE payload or decrypt failed; content remains opaque
+                                counter!("mls_gateway_events_processed", "kind" => "445_nip_service_decrypt_skip").increment(1);
+                            }
+                        } else {
+                            counter!("mls_gateway_events_processed", "kind" => "445_nip_service_not_member").increment(1);
+                        }
+                    } else {
+                        // Missing configuration for user id
+                        counter!("mls_gateway_events_processed", "kind" => "445_nip_service_missing_user_id").increment(1);
+                    }
+                }
+            }
         }
 
         counter!("mls_gateway_events_processed", "kind" => "445").increment(1);

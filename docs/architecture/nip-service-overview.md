@@ -20,11 +20,21 @@ What NIP-SERVICE accomplishes
 - Keeps profiles focused on domain logic (parameters, payloads, policies), not transport/auth plumbing
 
 Key building blocks
-- service-request (kind 40910): Admin → Relay, non-sensitive parameters + jwt_proof
+- service-request (MLS-first): Admin → Relay via MLS application message carried in a Nostr kind 445 envelope (outer tags strictly non-sensitive, e.g., ["h", group_id]); dev fallback: 40910 JSON
 - service-notify (MLS preferred): Relay → Admin group(s), sensitive/non-sensitive payload per profile
-- service-ack (kind 40911 or MLS): Admin → Relay, acks/approvals
+- service-ack: Admin → Relay, preferably MLS; dev fallback: 40911 JSON for non-sensitive acks
 - Service member: Relay’s MLS identity for secure group delivery
 - Audit store: DB/Firestore for action entries, states, results, notify IDs
+
+Transport & Gating (Implementation Guidance)
+- MLS-first transport: Sensitive control payloads travel inside MLS ciphertext; the outer 445 envelope contains only non-sensitive routing tags.
+- Membership-first gating: Attempt decrypt ONLY if the service-member MLS client has the target group loaded in memory (has_group(client, user_id, group_id)). Registry flags are advisory for ops/UX and MUST NOT be treated as authorization.
+- Handler selection: Deployments select a single active handler for service actions ("in-process" or "external"). The other path SHOULD be passive. Idempotency by action_id remains mandatory to neutralize duplicates in hybrid scenarios.
+- Deployment config keys (example):
+  - enable_in_process_decrypt (bool; default true)
+  - preferred_service_handler ("in-process" | "external"; default "in-process")
+  - gating_use_registry_hint (bool; default false; ops hint only)
+  - mls_service_user_id (string; user id used for in-process has_group gating)
 
 How it works (at a glance)
 - Admin signs in (app attest + TOTP), obtains jwt_proof, and submits service-request specifying action_type + profile + params
@@ -48,7 +58,7 @@ flowchart LR
     S[Server (e.g., loxation-server)<br/>Exec/Verify Plane]
   end
 
-  A -- service-request/ack (Nostr) --> R
+  A -- service-request (MLS-first via kind 445) / ack (MLS or Nostr) --> R
   R -- write audit + state --> D
   R -- service-notify (MLS) --> A
   S -- optional read/verify (profile-specific) --> D
@@ -68,7 +78,7 @@ sequenceDiagram
   participant DB as DB/Firestore
   participant MLS as MLS Admin Group
 
-  note over Admin,Relay: 1) Admin submits service-request (40910), e.g., action_type="rotation", profile="nip-kr/0.1.0"
+  note over Admin,Relay: 1) Admin submits service-request (MLS-first; NIP-SERVICE JSON in MLS, carried via kind 445) [dev: 40910 fallback], e.g., action_type="rotation", profile="nip-kr/0.1.0"
   Admin->>Relay: service-request {action_id, client_id, profile, params, jwt_proof}
 
   note over Relay: 2) Authorize & prepare

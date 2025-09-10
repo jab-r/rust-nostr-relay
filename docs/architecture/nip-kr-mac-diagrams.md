@@ -23,8 +23,8 @@ sequenceDiagram
   participant MLS as MLS Admin Group
   participant Svc as Relay MLS Service Member
 
-  note over Admin,Relay: 1) Admin initiates rotation via rotate-request (Nostr 40901 + jwt_proof)
-  Admin->>Relay: rotate-request {client_id, rotation_id, not_before, grace, jwt_proof}
+  note over Admin,Relay: 1) Admin initiates rotation via service-request (MLS-first; NIP-KR payload in MLS, carried via kind 445) [dev: 40901/40910 fallback] + jwt_proof
+  Admin->>Relay: rotate-request (MLS payload) {client_id, rotation_id, not_before, grace, jwt_proof}
 
   note over Relay: 2) Authorize: verify MLS membership + validate jwt_proof via JWKS
   Relay->>Relay: AuthZ OK (MLS group & jwt_proof)
@@ -39,7 +39,7 @@ sequenceDiagram
   Relay->>FS: Create oauth2_clients/{clientId}/secrets/{versionId} (state=pending, not_before, mac_key_ref, algo)
   Relay->>FS: Upsert oauth2_rotations/{rotationId} (quorum, not_before, grace_until)
 
-  note over Relay,MLS: 5) Distribute via MLS to authorized admins (scoped by client_id)
+  note over Relay,MLS: 5) Distribute via MLS to authorized admins (scoped by client_id; E2EE)
   Relay->>Svc: Use service-member state (MlsClient) to compose MLS app msg
   Svc->>MLS: Post kind 445 (rotate-notify payload with plaintext secret + metadata)
   MLS-->>Admin: Encrypted delivery to MLS admin group members
@@ -55,7 +55,7 @@ sequenceDiagram
 ```
 
 Key notes
-- The Relay acts as an MLS service member (Svc), composing MLS application messages for the admin group. This enables secure, E2EE distribution of the plaintext secret to authorized admins only.
+- The Relay acts as an MLS service member (Svc) or delegates to an external service member. Membership-first gating is authoritative: decrypt is only attempted if the service-member has the group loaded (fast in-memory has_group check). Registry flags are advisory (ops/UX), not authorization.
 - Firestore persists only secret_hash and metadata (algo, mac_key_ref, windows, state); no plaintext ever persisted.
 - Idempotency (rotation_id) and transactions (pointer flips) prevent races and ensure atomic promotion.
 

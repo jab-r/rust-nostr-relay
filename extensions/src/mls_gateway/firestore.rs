@@ -23,6 +23,8 @@ pub struct GroupInfo {
     pub last_epoch: Option<i64>,
     #[serde(default)]
     pub admin_pubkeys: Vec<String>,
+    #[serde(default)]
+    pub service_member: bool,
     #[serde(with = "chrono::serde::ts_seconds")]
     pub created_at: DateTime<Utc>,
     #[serde(with = "chrono::serde::ts_seconds")]
@@ -102,10 +104,10 @@ impl FirestoreStorage {
 
         // Preserve existing owner and created_at if the group already exists
         let existing = self.fetch_group(group_id).await?;
-        let (owner_val, created_at_val, existing_admins, existing_display_name, existing_last_epoch) = if let Some(g) = existing {
-            (g.owner_pubkey, g.created_at, g.admin_pubkeys, g.display_name, g.last_epoch)
+        let (owner_val, created_at_val, existing_admins, existing_display_name, existing_last_epoch, existing_service_member) = if let Some(g) = existing {
+            (g.owner_pubkey, g.created_at, g.admin_pubkeys, g.display_name, g.last_epoch, g.service_member)
         } else {
-            (owner_pubkey.to_string(), now, Vec::new(), None, None)
+            (owner_pubkey.to_string(), now, Vec::new(), None, None, false)
         };
 
         let group = GroupInfo {
@@ -114,6 +116,7 @@ impl FirestoreStorage {
             owner_pubkey: owner_val,
             last_epoch: Some(last_epoch).or(existing_last_epoch),
             admin_pubkeys: existing_admins,
+            service_member: existing_service_member,
             created_at: created_at_val,
             updated_at: now,
         };
@@ -122,7 +125,7 @@ impl FirestoreStorage {
         self.db
             .fluent()
             .update()
-            .fields(paths!(GroupInfo::{group_id, display_name, owner_pubkey, last_epoch, admin_pubkeys, created_at, updated_at}))
+            .fields(paths!(GroupInfo::{group_id, display_name, owner_pubkey, last_epoch, admin_pubkeys, service_member, created_at, updated_at}))
             .in_col("mls_groups")
             .document_id(group_id)
             .object(&group)
@@ -146,6 +149,11 @@ impl FirestoreStorage {
             .await?;
 
         Ok(())
+    }
+    
+    /// Returns true if the group is flagged to contain a service member
+    pub async fn has_service_member(&self, group_id: &str) -> Result<bool> {
+        Ok(self.fetch_group(group_id).await?.map(|g| g.service_member).unwrap_or(false))
     }
 }
 

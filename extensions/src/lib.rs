@@ -26,6 +26,11 @@ pub mod mls_gateway;
 #[cfg(feature = "mls_gateway")]
 pub use mls_gateway::MlsGateway;
 
+#[cfg(feature = "nip_service")]
+pub mod nip_service;
+#[cfg(feature = "nip_service")]
+pub use nip_service::NipService;
+
 #[cfg(test)]
 pub fn temp_data_path(p: &str) -> anyhow::Result<tempfile::TempDir> {
     Ok(tempfile::Builder::new()

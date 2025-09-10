@@ -35,10 +35,17 @@ Scope
 
 Protocol Overview
 
-Message types
-- service-request (Nostr): Admin → Relay; non-sensitive parameters; references a profile and client scope.
-- service-notify (MLS or Nostr): Relay → Admin group(s); sensitive or non-sensitive result/payload distribution per profile.
-- service-ack (MLS or Nostr): Admin → Relay; acknowledgement, approval, or completion signals per policy.
+Message types (MLS-first)
+- service-request (MLS preferred; carried inside a Nostr envelope):
+  - Admin → Relay (Service Member) using an MLS application message addressed to the target admin group.
+  - The outer Nostr event carries only routing metadata (e.g., ["h", group_id]) and MUST NOT contain sensitive fields. The inner MLS payload carries action_type, profile, params, jwt_proof, etc., encrypted end-to-end to the group (including the service member).
+  - Production deployments SHOULD use MLS for service-request to avoid leaking control operations.
+  - A fallback Nostr JSON envelope (kind 40910) is defined for dev/test or non-sensitive flows; discouraged in production.
+- service-notify (MLS preferred; Nostr optional for non-sensitive):
+  - Relay → Admin group(s) with MLS payload containing sensitive or result data.
+  - If notify is strictly non-sensitive, a Nostr event (kind 40912) MAY be used.
+- service-ack:
+  - Admin → Relay; MAY be MLS (preferred) or Nostr (40911) depending on sensitivity. Acks can be kept non-sensitive (e.g., only action_id), but MLS is recommended for uniformity.
 
 Role of Service Member (MLS)
 - The relay runs as an MLS “service member” within each client’s admin group(s).
@@ -46,10 +53,14 @@ Role of Service Member (MLS)
 - For non-sensitive actions, notify can be a Nostr event; MLS still recommended for uniformity/authorization.
 
 Kinds and Tags (Enterprise/private experimental)
-- Proposed kinds (to be namespaced per relay deployment):
-  - 40910: service-request
-  - 40911: service-ack
-  - 40912: service-notify (if using Nostr for non-sensitive notify; MLS preferred for sensitive data)
+- MLS carriage (preferred):
+  - service-request and service-notify are MLS ciphertexts transported via standard MLS group message events (e.g., kind 445). The Nostr envelope includes only routing tags such as:
+    - ["h", group_id] — target MLS group
+    - Optional minimal scoping tags (non-sensitive); avoid leaking action types
+- Nostr control kinds (fallback/dev/test):
+  - 40910: service-request (JSON; discouraged in production)
+  - 40911: service-ack (JSON; acceptable if non-sensitive)
+  - 40912: service-notify (JSON; only for non-sensitive notify)
 - Tags (common across kinds; profiles may add):
   - ["service", action_type] — e.g., "rotation", "policy_update"
   - ["action", action_id]
@@ -57,6 +68,15 @@ Kinds and Tags (Enterprise/private experimental)
   - ["mls", mls_group] — primary admin group scope
   - ["nip-service", "0.1.0"]
   - ["profile", profile_id] — e.g., "nip-kr/0.1.0"
+
+Decrypt Gating (Implementation Guidance)
+- Implementations SHOULD NOT attempt to decrypt every MLS group message (kind 445).
+- Membership-first gating: Attempt decrypt ONLY if the service-member MLS client has the group loaded in memory (e.g., has_group(client, user_id, group_id)). This is the primary condition. Registry flags are advisory for ops/UX and MUST NOT be treated as authorization.
+- Gate decryption using non-sensitive signals:
+  - Group registry flag (preferred): mark group metadata service_member=true (or capabilities includes "nip-service"). The relay attempts MLS-first decrypt/dispatch ONLY for such groups.
+  - Optional event hint (deployment-specific): a generic, non-sensitive hint tag MAY be used; action types and profiles MUST NOT be exposed in 445 tags.
+- Roster/Policy integration: An admin-signed roster/policy stream (e.g., kind 450) MAY set/unset the service_member flag. The group registry SHOULD honor it immediately for gating.
+- Observability: Track decrypt_attempted/ok/err/skipped metrics by group. Never log plaintext; logs MUST remain redacted.
 
 Authorization (Normative)
 - The relay MUST verify:
@@ -92,9 +112,11 @@ Data Model (Audit) — Example (Firestore/DB)
   - created_at / updated_at: timestamp
 
 Transport Requirements (Normative)
-- Control-plane (service-request/ack) via Nostr MUST NOT include sensitive plaintext.
+- Control-plane confidentiality:
+  - service-request MUST use MLS (carried in a Nostr envelope) in production. Fallback 40910 is for dev/test or non-sensitive cases only.
+  - service-ack SHOULD use MLS for uniform confidentiality; a Nostr ack (40911) MAY be used if strictly non-sensitive.
 - Data-plane (service-notify) for sensitive results MUST be MLS to authorized admin group(s).
-- TLS MUST be used for all network paths.
+- Outer transport is Nostr WebSocket; inner sensitive content is MLS-encrypted. TLS MUST be used for all network paths.
 
 Canonical Encoding and Encoding Rules
 - For profile-specific MAC or cryptographic operations (e.g., NIP-KR Rotation), canonical encodings are defined by the profile (see nip-kr.md).
@@ -102,7 +124,25 @@ Canonical Encoding and Encoding Rules
 
 Message Formats
 
-service-request (Nostr) — kind 40910
+MLS service-request (preferred; carried via Nostr kind 445)
+- Envelope (Nostr):
+  - kind: 445 (MLS group message)
+  - tags: MUST include ["h", group_id]; SHOULD avoid revealing action types; additional non-sensitive routing tags MAY be added by deployment policy
+  - content: MLS ciphertext (opaque to the relay except via its service-member MLS identity)
+- MLS payload (JSON inside MLS, encrypted E2EE to group members including service member):
+  {
+    "action_type": "rotation",                 // profile-defined
+    "action_id": "ULID/UUID",
+    "client_id": "string",
+    "profile": "nip-kr/0.1.0",
+    "params": { /* profile-specific */ },
+    "jwt_proof": "compact JWS"
+  }
+
+Note: The relay processes the decrypted payload only through its MLS service-member identity; no plaintext is exposed in Nostr or logs.
+
+
+service-request (Nostr) — kind 40910 (fallback/dev/test)
 - tags (MUST include):
   - ["service", action_type]
   - ["profile", profile_id]              // e.g., "nip-kr/0.1.0"
@@ -155,6 +195,26 @@ Service Member Responsibilities (Relay)
 - Maintain a durable MLS state for the service identity (“service member”) using a secure provider (e.g., SQLite + SQLCipher persisted via GCS Fuse in Cloud Run).
 - For sensitive actions, compose MLS application messages for the admin group(s) with the service member.
 - Securely handle any plaintext in memory only; never persist plaintext to DB or logs.
+
+Implementation Placement (Informative)
+- In-process service member (inside the relay):
+  - Pros: simpler wiring and lower latency; direct access to inbound 445 events; unified observability.
+  - Cons: larger blast radius; relay and MLS logic are coupled; careful resource isolation needed.
+- Out-of-process service member (separate service):
+  - Pros: strong fault/isolation boundaries; independent scaling and deployment cadence; portability across relays.
+  - Cons: higher complexity (ingest/publish paths, retries, idempotency), additional credentials, and registry synchronization.
+
+This specification is transport/profile-centric and placement-agnostic. Deployments MUST preserve the same JSON schemas, authorization rules (jwt_proof + MLS membership), and confidentiality guarantees regardless of placement.
+
+Implementation Configuration (Deployment)
+- enable_in_process_decrypt: boolean (default: true)
+  - When false, the relay never attempts in-process decrypt/dispatch; external service-members can handle MLS messages as normal clients.
+- preferred_service_handler: "in-process" | "external" (default: "in-process")
+  - Selects a single active handler at deployment scope. The non-selected path SHOULD be passive to reduce churn. Idempotency by action_id MUST remain enforced to neutralize duplicates in hybrid scenarios.
+- gating_use_registry_hint: boolean (default: false)
+  - Optional prefilter to skip attempts when registry does not mark a group as service-enabled. Security note: this is an ops hint only; MLS membership remains the authoritative gate.
+- mls_service_user_id: string (optional)
+  - Service-member user identifier for the relay’s MLS client, used by the membership-first gate (has_group(client, user_id, group_id)) when in-process decrypt is enabled.
 
 Profiles
 

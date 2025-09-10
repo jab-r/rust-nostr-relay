@@ -252,8 +252,8 @@ Documents and collections:
 ## Message Formats
 
 NIP-SERVICE profile binding
-- This specification can be invoked via NIP-SERVICE (see nip-service.md) using service-request (kind 40910) with action_type="rotation" and profile="nip-kr/0.1.0".
-- Implementations MAY continue to accept the native rotate-request (kind 40901). A deployment can support both, aliasing 40910 requests to this profile.
+- This specification can be invoked via NIP-SERVICE (see nip-service.md). In production, the rotate-request payload SHOULD be carried as an MLS application message to the admin group and transported via a Nostr kind 445 envelope (MLS-first). The generic 40910 service-request is a dev/test fallback.
+- Implementations MAY continue to accept the native rotate-request (kind 40901). A deployment can support both, aliasing MLS-first/40910 requests to this profile.
 
 ### rotate-request (Nostr event)
 
@@ -287,7 +287,13 @@ Example:
 }
 ```
 
-Alternate delivery via NIP-SERVICE (service-request, kind 40910)
+MLS-first delivery (preferred)
+- Carry the rotate-request JSON as the inner MLS application message addressed to the authorized admin group and transport it via a Nostr kind 445 envelope.
+- The outer 445 event MUST include only non-sensitive routing tags (e.g., ["h", group_id]); do not expose action types or profiles in tags.
+- Decrypt gating: Implementations SHOULD NOT attempt to decrypt every 445. Attempt MLS-first decrypt/dispatch only for groups flagged as service_member=true (or equivalent capability) in the group registry. See “Decrypt Gating” in nip-service.md for guidance.
+- Observability: Never log plaintext; track only non-sensitive metrics (attempted/ok/err/skipped by group).
+
+NIP-SERVICE delivery (dev fallback: service-request, kind 40910)
 
 - When using NIP-SERVICE, clients send service-request 40910 with tags:
   - ["service", "rotation"], ["profile", "nip-kr/0.1.0"], ["client", client_id], ["mls", mls_group], ["action", rotation_id], ["nip-service", "0.1.0"]

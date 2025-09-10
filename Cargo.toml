@@ -37,10 +37,12 @@ futures-util = "0.3"
 serde_json = "1.0"
 
 [features]
-default = ["mls_gateway"]
+default = ["mls_gateway", "nip_service"]
 mls_gateway = ["nostr-extensions/mls_gateway"]
 mls_gateway_firestore = ["nostr-extensions/mls_gateway_firestore"]
 mls_gateway_sql = ["nostr-extensions/mls_gateway_sql"]
+nip_service = ["nostr-extensions/nip_service"]
+nip_service_mls = ["nostr-extensions/nip_service_mls"]
 # zstd = ["nostr-db/zstd"]
 
 [workspace]
