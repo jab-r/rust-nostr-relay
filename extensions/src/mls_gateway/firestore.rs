@@ -40,6 +40,16 @@ struct AdminsPatch {
     pub updated_at: DateTime<Utc>,
 }
 
+/// KeyPackage Relays list document (kind 10051)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct KeypackageRelays {
+    pub owner_pubkey: String,
+    #[serde(default)]
+    pub relays: Vec<String>,
+    #[serde(with = "chrono::serde::ts_seconds")]
+    pub updated_at: DateTime<Utc>,
+}
+
 /// Firestore storage implementation
 #[derive(Debug)]
 pub struct FirestoreStorage {
@@ -309,6 +319,45 @@ impl MlsStorage for FirestoreStorage {
             
         info!("Stored roster/policy event: group={}, seq={}, op={}", group_id, sequence, operation);
         Ok(())
+    }
+
+    async fn upsert_keypackage_relays(&self, owner_pubkey: &str, relays: &[String]) -> anyhow::Result<()> {
+        let rec = KeypackageRelays {
+            owner_pubkey: owner_pubkey.to_string(),
+            relays: relays.to_vec(),
+            updated_at: Utc::now(),
+        };
+
+        self.db
+            .fluent()
+            .update()
+            .fields(paths!(KeypackageRelays::{owner_pubkey, relays, updated_at}))
+            .in_col("keypackage_relays")
+            .document_id(owner_pubkey)
+            .object(&rec)
+            .execute()
+            .await?;
+
+        info!("Upserted KeyPackage relays list for owner {}", owner_pubkey);
+        Ok(())
+    }
+
+    async fn get_keypackage_relays(&self, owner_pubkey: &str) -> anyhow::Result<Vec<String>> {
+        let docs = self.db
+            .fluent()
+            .select()
+            .from("keypackage_relays")
+            .filter(|f| f.field("owner_pubkey").eq(owner_pubkey))
+            .limit(1)
+            .query()
+            .await?;
+
+        let mut items: Vec<KeypackageRelays> = docs
+            .into_iter()
+            .filter_map(|doc| firestore::FirestoreDb::deserialize_doc_to::<KeypackageRelays>(&doc).ok())
+            .collect();
+
+        Ok(items.pop().map(|k| k.relays).unwrap_or_default())
     }
 }
 

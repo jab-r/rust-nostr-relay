@@ -43,6 +43,7 @@ const MLS_GROUP_MESSAGE_KIND: u16 = 445;  // MLS Group Message
 const NOISE_DM_KIND: u16 = 446;           // Noise Direct Message
 const KEYPACKAGE_REQUEST_KIND: u16 = 447; // KeyPackage Request (Nostr-based)
 const ROSTER_POLICY_KIND: u16 = 450;      // Roster/Policy (Admin-signed membership control)
+const KEYPACKAGE_RELAYS_LIST_KIND: u16 = 10051; // KeyPackage Relays List
 const GIFTWRAP_KIND: u16 = 1059;          // Giftwrap envelope for Welcome
 
 /// Storage backend type configuration
@@ -98,6 +99,13 @@ pub struct MlsGatewayConfig {
     pub gating_use_registry_hint: bool,
     /// MLS service-member user identifier used for membership checks
     pub mls_service_user_id: Option<String>,
+
+    /// Backfill Firestore archived events into LMDB on startup
+    pub backfill_on_startup: bool,
+    /// Kinds to backfill from Firestore into LMDB
+    pub backfill_kinds: Vec<u32>,
+    /// Upper bound on total events to backfill
+    pub backfill_max_events: u32,
 }
 
 impl Default for MlsGatewayConfig {
@@ -108,7 +116,7 @@ impl Default for MlsGatewayConfig {
             database_url: None,
             keypackage_ttl: 604800, // 7 days
             welcome_ttl: 259200,    // 3 days
-            enable_api: true,
+            enable_api: false,
             api_prefix: "/api/v1".to_string(),
             enable_message_archive: true,
             message_archive_ttl_days: 30,
@@ -120,6 +128,9 @@ impl Default for MlsGatewayConfig {
             preferred_service_handler: "in-process".to_string(),
             gating_use_registry_hint: false,
             mls_service_user_id: None,
+            backfill_on_startup: true,
+            backfill_kinds: vec![445, 1059, 446],
+            backfill_max_events: 50000,
         }
     }
 }
@@ -157,6 +168,10 @@ pub trait MlsStorage: Send + Sync {
         admin_pubkey: &str,
         created_at: i64,
     ) -> anyhow::Result<()>;
+
+    /// KeyPackage Relays List per owner (kind 10051)
+    async fn upsert_keypackage_relays(&self, owner_pubkey: &str, relays: &[String]) -> anyhow::Result<()>;
+    async fn get_keypackage_relays(&self, owner_pubkey: &str) -> anyhow::Result<Vec<String>>;
 }
 
 /// MLS Gateway Extension
@@ -279,6 +294,24 @@ impl StorageBackend {
             }
         }
     }
+
+    async fn upsert_keypackage_relays(&self, owner_pubkey: &str, relays: &[String]) -> anyhow::Result<()> {
+        match self {
+            #[cfg(feature = "mls_gateway_sql")]
+            StorageBackend::Sql(storage) => storage.upsert_keypackage_relays(owner_pubkey, relays).await,
+            #[cfg(feature = "mls_gateway_firestore")]
+            StorageBackend::Firestore(storage) => storage.upsert_keypackage_relays(owner_pubkey, relays).await,
+        }
+    }
+
+    async fn get_keypackage_relays(&self, owner_pubkey: &str) -> anyhow::Result<Vec<String>> {
+        match self {
+            #[cfg(feature = "mls_gateway_sql")]
+            StorageBackend::Sql(storage) => storage.get_keypackage_relays(owner_pubkey).await,
+            #[cfg(feature = "mls_gateway_firestore")]
+            StorageBackend::Firestore(storage) => storage.get_keypackage_relays(owner_pubkey).await,
+        }
+    }
 }
 
 pub struct MlsGateway {
@@ -314,6 +347,13 @@ impl MlsGateway {
         describe_counter!("mls_gateway_welcomes_stored", "Number of welcome messages stored");
         describe_counter!("mls_gateway_giftwarps_processed", "Number of giftwrap envelopes processed");
         describe_counter!("mls_gateway_membership_updates", "Number of membership updates from giftwarps");
+        // Validation/hygiene counters
+        describe_counter!("mls_gateway_443_missing_tag", "Count of KeyPackage events missing required tags");
+        describe_counter!("mls_gateway_443_invalid_tag", "Count of KeyPackage events with invalid tag values");
+        describe_counter!("mls_gateway_443_content_invalid", "Count of KeyPackage events with invalid hex content");
+        describe_counter!("mls_gateway_445_unexpected_tag", "Count of unexpected outer tags observed on kind 445 events");
+        describe_counter!("mls_gateway_top_level_444_dropped", "Number of top-level 444 events dropped (should be wrapped in 1059)");
+        describe_counter!("mls_gateway_10051_processed", "Number of KeyPackage Relays List (10051) events processed");
         describe_histogram!("mls_gateway_db_operation_duration", "Duration of database operations");
 
         // Initialize storage backend
@@ -416,6 +456,60 @@ impl MlsGateway {
                 warn!("Rejecting expired KeyPackage from {}", event_pubkey);
                 return Err(anyhow::anyhow!("KeyPackage has expired"));
             }
+        }
+
+        // NIP-EE required tags (soft validation)
+        let mls_version = event.tags().iter()
+            .find(|tag| tag.len() >= 2 && tag[0] == "mls_protocol_version")
+            .map(|tag| tag[1].clone());
+        match mls_version.as_deref() {
+            Some("1.0") => {}
+            Some(other) => {
+                warn!("KeyPackage mls_protocol_version invalid: {}", other);
+                counter!("mls_gateway_443_invalid_tag").increment(1);
+            }
+            None => {
+                warn!("KeyPackage missing required tag: mls_protocol_version");
+                counter!("mls_gateway_443_missing_tag").increment(1);
+            }
+        }
+
+        let ciphersuite = event.tags().iter()
+            .find(|tag| tag.len() >= 2 && tag[0] == "ciphersuite")
+            .map(|tag| tag[1].clone());
+        if ciphersuite.is_none() {
+            warn!("KeyPackage missing required tag: ciphersuite");
+            counter!("mls_gateway_443_missing_tag").increment(1);
+        }
+
+        let extensions = event.tags().iter()
+            .find(|tag| tag.len() >= 2 && tag[0] == "extensions")
+            .map(|tag| tag[1..].to_vec());
+        if extensions.is_none() {
+            warn!("KeyPackage missing required tag: extensions");
+            counter!("mls_gateway_443_missing_tag").increment(1);
+        }
+
+        // Relays: accept either a single ["relays", ..many..] tag or multiple ["relay", url] tags
+        let relays_vec = event.tags().iter()
+            .find(|tag| !tag.is_empty() && tag[0] == "relays")
+            .map(|tag| tag[1..].to_vec());
+        let relay_tags: Vec<String> = event.tags().iter()
+            .filter(|tag| tag.len() >= 2 && tag[0] == "relay")
+            .map(|tag| tag[1].clone())
+            .collect();
+        let relays_present = relays_vec.as_ref().map(|v| !v.is_empty()).unwrap_or(false) || !relay_tags.is_empty();
+        if !relays_present {
+            warn!("KeyPackage missing relays list (tag 'relays' or repeated 'relay')");
+            counter!("mls_gateway_443_missing_tag").increment(1);
+        }
+
+        // Content shape: expect hex-encoded KeyPackageBundle (soft check)
+        let content = event.content().trim();
+        let is_hex = !content.is_empty() && content.len() % 2 == 0 && content.bytes().all(|b| (b as char).is_ascii_hexdigit());
+        if !is_hex {
+            warn!("KeyPackage content is not valid hex payload (soft validation)");
+            counter!("mls_gateway_443_content_invalid").increment(1);
         }
         
         info!("Processing KeyPackage from owner: {}", event_pubkey);
@@ -589,6 +683,33 @@ impl MlsGateway {
         Ok(())
     }
 
+    /// Handle KeyPackage Relays List (kind 10051)
+    async fn handle_keypackage_relays_list(&self, event: &Event) -> anyhow::Result<()> {
+        let store = self.store()?;
+        let owner_pubkey = hex::encode(event.pubkey());
+
+        // Collect relay URLs from tags
+        let relays: Vec<String> = event.tags().iter()
+            .filter(|tag| tag.len() >= 2 && tag[0] == "relay")
+            .map(|tag| tag[1].clone())
+            .collect();
+
+        if relays.is_empty() {
+            warn!("KeyPackage Relays List (10051) missing relay tags");
+            return Err(anyhow::anyhow!("Missing relay tags in 10051"));
+        }
+
+        // Deduplicate relays
+        let mut dedup = relays.clone();
+        dedup.sort();
+        dedup.dedup();
+
+        store.upsert_keypackage_relays(&owner_pubkey, &dedup).await?;
+        counter!("mls_gateway_10051_processed").increment(1);
+        counter!("mls_gateway_events_processed", "kind" => "10051").increment(1);
+        Ok(())
+    }
+
     /// Handle Roster/Policy event (kind 450)
     async fn handle_roster_policy(&self, event: &Event) -> anyhow::Result<()> {
         let store = self.store()?;
@@ -733,8 +854,19 @@ impl Extension for MlsGateway {
         "mls-gateway"
     }
 
-    fn setting(&mut self, _setting: &nostr_relay::setting::SettingWrapper) {
-        // Settings can be updated here if needed
+    fn setting(&mut self, setting: &nostr_relay::setting::SettingWrapper) {
+        // Load configuration from relay Setting.extra under key "mls_gateway"
+        let r = setting.read();
+        let mut cfg: MlsGatewayConfig = r.parse_extension("mls_gateway");
+        drop(r);
+
+        // Safety: do not expose REST API unless explicitly allowed
+        if cfg.enable_api && std::env::var("MLS_API_UNSAFE_ALLOW").unwrap_or_default() != "true" {
+            info!("Disabling MLS Gateway REST API until proper authentication is in place");
+            cfg.enable_api = false;
+        }
+
+        self.config = cfg;
         info!("MLS Gateway settings updated");
     }
 
@@ -767,47 +899,44 @@ impl Extension for MlsGateway {
         if let nostr_relay::message::IncomingMessage::Event(event) = &msg.msg {
             match event.kind() {
                 KEYPACKAGE_KIND => {
-                    // KeyPackage (443) - validate and process
+                    // KeyPackage (443) - validate and process using gateway handler
+                    let config = self.config.clone();
+                    let store = match self.store() {
+                        Ok(store) => store.clone(),
+                        Err(e) => {
+                            error!("MLS Gateway not initialized: {}", e);
+                            return ExtensionMessageResult::Continue(msg);
+                        }
+                    };
                     let event_clone = event.clone();
                     tokio::spawn(async move {
-                        // Extract owner from p tag (should match pubkey for security)
-                        let owner_tag = event_clone.tags().iter()
-                            .find(|tag| tag.len() >= 2 && tag[0] == "p")
-                            .map(|tag| tag[1].clone());
-                            
-                        let event_pubkey = hex::encode(event_clone.pubkey());
-                        
-                        // Verify owner matches event pubkey (security requirement)
-                        if let Some(owner) = &owner_tag {
-                            if owner != &event_pubkey {
-                                warn!("KeyPackage owner tag {} doesn't match event pubkey {}", owner, event_pubkey);
-                                return;
-                            }
+                        let mut gateway = MlsGateway::new(config);
+                        gateway.store = Some(store);
+                        gateway.initialized = true;
+                        if let Err(e) = gateway.handle_keypackage(&event_clone).await {
+                            error!("Error handling KeyPackage (443): {}", e);
                         }
-                        
-                        // Extract expiry from exp tag
-                        let expiry = event_clone.tags().iter()
-                            .find(|tag| tag.len() >= 2 && tag[0] == "exp")
-                            .and_then(|tag| tag[1].parse::<i64>().ok());
-                            
-                        // Check if expired
-                        if let Some(exp_timestamp) = expiry {
-                            let now = chrono::Utc::now().timestamp();
-                            if exp_timestamp <= now {
-                                warn!("Rejecting expired KeyPackage from {}", event_pubkey);
-                                return;
-                            }
-                        }
-                        
-                        info!("Processing KeyPackage from owner: {}", event_pubkey);
-                        counter!("mls_gateway_keypackages_stored").increment(1);
-                        counter!("mls_gateway_events_processed", "kind" => "443").increment(1);
                     });
+                }
+                WELCOME_KIND => {
+                    // Top-level Welcome events should never appear; they must be inside 1059 giftwrap.
+                    warn!("Dropping top-level 444 Welcome event; must be carried inside giftwrap (1059)");
+                    counter!("mls_gateway_top_level_444_dropped").increment(1);
                 }
                 GIFTWRAP_KIND => {
                     // Giftwrap (1059) containing Welcome (444)
                     let event_clone = event.clone();
+                    let archive = self.message_archive.clone();
+                    let config = self.config.clone();
+                    let ttl_days = config.message_archive_ttl_days;
                     tokio::spawn(async move {
+                        // Attempt to archive giftwrap for offline delivery (requires p tag for recipient)
+                        if let Some(archive) = archive {
+                            if let Err(e) = archive.archive_event(&event_clone, Some(ttl_days)).await {
+                                warn!("Failed to archive Giftwrap (1059) for offline delivery: {}", e);
+                            }
+                        }
+
                         // Extract recipient and group ID from tags
                         let recipient = event_clone.tags().iter()
                             .find(|tag| tag.len() >= 2 && tag[0] == "p")
@@ -881,6 +1010,26 @@ impl Extension for MlsGateway {
                     counter!("mls_gateway_events_processed", "kind" => "446").increment(1);
                     info!("Processing Noise DM from {}", hex::encode(event.pubkey()));
                 }
+                KEYPACKAGE_RELAYS_LIST_KIND => {
+                    // KeyPackage Relays List (10051)
+                    let config = self.config.clone();
+                    let store = match self.store() {
+                        Ok(store) => store.clone(),
+                        Err(e) => {
+                            error!("MLS Gateway not initialized: {}", e);
+                            return ExtensionMessageResult::Continue(msg);
+                        }
+                    };
+                    let event_clone = event.clone();
+                    tokio::spawn(async move {
+                        let mut gateway = MlsGateway::new(config);
+                        gateway.store = Some(store);
+                        gateway.initialized = true;
+                        if let Err(e) = gateway.handle_keypackage_relays_list(&event_clone).await {
+                            error!("Error handling KeyPackage Relays List (10051): {}", e);
+                        }
+                    });
+                }
                 KEYPACKAGE_REQUEST_KIND => {
                     // KeyPackage Request (447)
                     let config = self.config.clone();
@@ -936,6 +1085,17 @@ impl MlsGateway {
     /// Static version of handle_mls_group_message for use in async context
     async fn handle_mls_group_message_static(store: StorageBackend, config: MlsGatewayConfig, event: &Event) -> anyhow::Result<()> {
         // Extract group ID and epoch from tags
+
+        // Outer tag hygiene (non-sensitive): warn on unexpected tags per NIP-EE (allow only "h" and optional "k")
+        let unexpected_tag_count = event.tags().iter()
+            .filter(|tag| !tag.is_empty())
+            .filter(|tag| tag[0] != "h" && tag[0] != "k")
+            .count();
+        if unexpected_tag_count > 0 {
+            warn!("kind 445 contains non-standard outer tags: count={}", unexpected_tag_count);
+            counter!("mls_gateway_445_unexpected_tag").increment(unexpected_tag_count as u64);
+        }
+
         let group_id_opt = event.tags().iter()
             .find(|tag| tag.len() >= 2 && tag[0] == "h")
             .map(|tag| tag[1].clone());

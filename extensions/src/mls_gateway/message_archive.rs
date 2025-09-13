@@ -17,6 +17,7 @@ use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::env;
+use std::collections::HashSet;
 use tracing::{debug, info, warn, instrument};
 
 /// Archived event data structure for Firestore storage
@@ -24,7 +25,7 @@ use tracing::{debug, info, warn, instrument};
 pub struct ArchivedEvent {
     /// Nostr event ID
     pub id: String,
-    /// Nostr event kind (445, 446)
+    /// Nostr event kind (445, 446, 1059)
     pub kind: u32,
     /// Event content
     pub content: String,
@@ -38,6 +39,10 @@ pub struct ArchivedEvent {
     pub sig: String,
     /// List of recipient pubkeys extracted from 'p' tags
     pub recipients: Vec<String>,
+    /// Optional Nostr group id (from 'h' tag) for MLS group events
+    pub group_id: Option<String>,
+    /// Optional group epoch (from 'k' tag)
+    pub group_epoch: Option<i64>,
     /// When this event was archived
     pub archived_at: i64,
     /// When this archived event expires
@@ -106,9 +111,22 @@ impl MessageArchive {
             .map(|tag| tag[1].clone())
             .collect();
 
-        // Skip archiving if no recipients found
-        if recipients.is_empty() {
-            debug!("Skipping archive for event {} - no recipients found", hex::encode(event.id()));
+        // Extract group id and epoch from tags (for kind 445 MLS group messages or giftwrap scoped to a group)
+        let group_id: Option<String> = event.tags().iter()
+            .find(|tag| tag.len() >= 2 && tag[0] == "h")
+            .map(|tag| tag[1].clone());
+
+        let group_epoch: Option<i64> = event.tags().iter()
+            .find(|tag| tag.len() >= 2 && tag[0] == "k")
+            .and_then(|tag| tag[1].parse::<i64>().ok());
+
+        // Skip archiving only if we have neither recipients nor group id.
+        // This allows archiving 445 events keyed by group_id even when there are no 'p' recipients.
+        if recipients.is_empty() && group_id.is_none() {
+            debug!(
+                "Skipping archive for event {} - no recipients and no group_id",
+                hex::encode(event.id())
+            );
             return Ok(());
         }
 
@@ -123,6 +141,8 @@ impl MessageArchive {
             pubkey: hex::encode(event.pubkey()),
             sig: hex::encode(event.sig()),
             recipients: recipients.clone(),
+            group_id,
+            group_epoch,
             archived_at: now.timestamp(),
             expires_at: expires_at.timestamp(),
         };
@@ -236,6 +256,183 @@ impl MessageArchive {
         Ok(events)
     }
 
+    /// Get MLS group messages by group_id since a timestamp
+    #[instrument(skip(self))]
+    pub async fn get_group_messages(&self, group_id: &str, since: i64, limit: u32) -> Result<Vec<Event>> {
+        let access_token = self.get_access_token().await?;
+        let now = Utc::now().timestamp();
+
+        // Build Firestore structured query for group-based retrieval
+        let query = json!({
+            "structuredQuery": {
+                "from": [{"collectionId": "archived_events"}],
+                "where": {
+                    "compositeFilter": {
+                        "op": "AND",
+                        "filters": [
+                            {
+                                "fieldFilter": {
+                                    "field": {"fieldPath": "group_id"},
+                                    "op": "EQUAL",
+                                    "value": {"stringValue": group_id}
+                                }
+                            },
+                            {
+                                "fieldFilter": {
+                                    "field": {"fieldPath": "created_at"},
+                                    "op": "GREATER_THAN",
+                                    "value": {"integerValue": since.to_string()}
+                                }
+                            },
+                            {
+                                "fieldFilter": {
+                                    "field": {"fieldPath": "expires_at"},
+                                    "op": "GREATER_THAN",
+                                    "value": {"integerValue": now.to_string()}
+                                }
+                            }
+                        ]
+                    }
+                },
+                "orderBy": [{"field": {"fieldPath": "created_at"}, "direction": "ASCENDING"}],
+                "limit": limit
+            }
+        });
+
+        let url = format!("{}:runQuery", self.base_url);
+        let response = self.http_client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", access_token))
+            .header("Content-Type", "application/json")
+            .json(&query)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(anyhow::anyhow!("Failed to query group messages ({}): {}", status, error_text));
+        }
+
+        let response_json: Value = response.json().await?;
+        let mut events = Vec::new();
+
+        if let Some(documents) = response_json.as_array() {
+            for doc in documents {
+                if let Some(document) = doc.get("document") {
+                    if let Some(fields) = document.get("fields") {
+                        match self.from_firestore_fields(fields) {
+                            Ok(archived_event) => {
+                                match self.archived_event_to_nostr_event(&archived_event) {
+                                    Ok(event) => events.push(event),
+                                    Err(e) => warn!("Failed to convert archived event to Nostr event: {}", e),
+                                }
+                            }
+                            Err(e) => warn!("Failed to parse archived group event: {}", e),
+                        }
+                    }
+                }
+            }
+        }
+
+        info!("Retrieved {} group messages for group {} since {}", events.len(), group_id, since);
+        Ok(events)
+    }
+
+    /// List recent archived events by kinds, ordered by created_at ASC, TTL-respecting
+    /// This is used at relay startup to reconstitute LMDB so clients can use pure Nostr REQ.
+    pub async fn list_recent_events_by_kinds(
+        &self,
+        kinds: &[u32],
+        since: i64,
+        total_limit: u32,
+    ) -> Result<Vec<Event>> {
+        let access_token = self.get_access_token().await?;
+        let now = Utc::now().timestamp();
+
+        let mut collected: Vec<Event> = Vec::new();
+        let mut seen_ids: HashSet<String> = HashSet::new();
+
+        for kind in kinds {
+            if collected.len() as u32 >= total_limit {
+                break;
+            }
+            // Limit per kind to avoid huge reads; Firestore hard-caps at 500 per page here.
+            let per_kind_limit = (total_limit.saturating_sub(collected.len() as u32)).min(500);
+
+            let query = json!({
+                "structuredQuery": {
+                    "from": [{"collectionId": "archived_events"}],
+                    "where": {
+                        "compositeFilter": {
+                            "op": "AND",
+                            "filters": [
+                                {
+                                    "fieldFilter": {
+                                        "field": {"fieldPath": "kind"},
+                                        "op": "EQUAL",
+                                        "value": {"integerValue": kind.to_string()}
+                                    }
+                                },
+                                {
+                                    "fieldFilter": {
+                                        "field": {"fieldPath": "created_at"},
+                                        "op": "GREATER_THAN",
+                                        "value": {"integerValue": since.to_string()}
+                                    }
+                                },
+                                {
+                                    "fieldFilter": {
+                                        "field": {"fieldPath": "expires_at"},
+                                        "op": "GREATER_THAN",
+                                        "value": {"integerValue": now.to_string()}
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                    "orderBy": [{"field": {"fieldPath": "created_at"}, "direction": "ASCENDING"}],
+                    "limit": per_kind_limit
+                }
+            });
+
+            let url = format!("{}:runQuery", self.base_url);
+            let response = self.http_client
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", access_token))
+                .header("Content-Type", "application/json")
+                .json(&query)
+                .send()
+                .await?;
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let error_text = response.text().await.unwrap_or_default();
+                return Err(anyhow::anyhow!("Failed to query recent events ({}): {}", status, error_text));
+            }
+
+            let response_json: Value = response.json().await?;
+            if let Some(documents) = response_json.as_array() {
+                for doc in documents {
+                    if let Some(document) = doc.get("document") {
+                        if let Some(fields) = document.get("fields") {
+                            if let Ok(archived_event) = self.from_firestore_fields(fields) {
+                                if seen_ids.insert(archived_event.id.clone()) {
+                                    if let Ok(event) = self.archived_event_to_nostr_event(&archived_event) {
+                                        collected.push(event);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        collected.sort_by_key(|e| e.created_at() as i64);
+        Ok(collected)
+    }
+
     /// Clean up expired archived events
     #[instrument(skip(self))]
     pub async fn cleanup_expired(&self) -> Result<u64> {
@@ -320,7 +517,8 @@ impl MessageArchive {
 
     /// Convert ArchivedEvent to Firestore document format
     fn to_firestore_document(&self, event: &ArchivedEvent) -> Result<Value> {
-        Ok(json!({
+        // Base fields
+        let mut doc = json!({
             "fields": {
                 "id": {"stringValue": event.id},
                 "kind": {"integerValue": event.kind.to_string()},
@@ -347,7 +545,17 @@ impl MessageArchive {
                 "archived_at": {"integerValue": event.archived_at.to_string()},
                 "expires_at": {"integerValue": event.expires_at.to_string()}
             }
-        }))
+        });
+
+        // Optionally include group_id and group_epoch for MLS group catch-up
+        if let Some(ref gid) = event.group_id {
+            doc["fields"]["group_id"] = json!({"stringValue": gid});
+        }
+        if let Some(epoch) = event.group_epoch {
+            doc["fields"]["group_epoch"] = json!({"integerValue": epoch.to_string()});
+        }
+
+        Ok(doc)
     }
 
     /// Convert Firestore fields to ArchivedEvent
@@ -405,6 +613,17 @@ impl MessageArchive {
             Vec::new()
         };
 
+        // Optional fields for group catch-up
+        let group_id = fields.get("group_id")
+            .and_then(|v| v.get("stringValue"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let group_epoch = fields.get("group_epoch")
+            .and_then(|v| v.get("integerValue"))
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<i64>().ok());
+
         Ok(ArchivedEvent {
             id: get_string("id")?,
             kind: get_int("kind")? as u32,
@@ -414,6 +633,8 @@ impl MessageArchive {
             pubkey: get_string("pubkey")?,
             sig: get_string("sig")?,
             recipients: get_string_array("recipients")?,
+            group_id,
+            group_epoch,
             archived_at: get_int("archived_at")?,
             expires_at: get_int("expires_at")?,
         })

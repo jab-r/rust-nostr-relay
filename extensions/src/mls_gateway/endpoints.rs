@@ -13,6 +13,13 @@ pub struct MissedMessagesRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct GroupMessagesRequest {
+    pub since: i64, // Unix timestamp
+    pub group_id: String,
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ArchivedMessage {
     pub id: String,
     pub kind: u32,
@@ -42,7 +49,8 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig, prefix: &str) {
             .route("/welcome", web::post().to(post_welcome))
             .route("/welcome", web::get().to(list_welcomes))
             .route("/welcome/{id}/ack", web::post().to(ack_welcome))
-            .route("/messages/missed", web::post().to(get_missed_messages)),
+            .route("/messages/missed", web::post().to(get_missed_messages))
+            .route("/messages/group", web::post().to(get_group_messages)),
     );
 }
 
@@ -123,7 +131,7 @@ async fn get_missed_messages(req: web::Json<MissedMessagesRequest>) -> ActixResu
     };
 
     let limit = req.limit.unwrap_or(100).min(500); // Max 500 messages per request
-    
+
     match archive.get_missed_messages(&req.pubkey, req.since, limit).await {
         Ok(events) => {
             let messages: Vec<ArchivedMessage> = events.into_iter().map(|event| {
@@ -139,10 +147,10 @@ async fn get_missed_messages(req: web::Json<MissedMessagesRequest>) -> ActixResu
                     sig: hex::encode(event.sig()),
                 }
             }).collect();
-            
+
             let count = messages.len() as u32;
             let has_more = count >= limit;
-            
+
             Ok(HttpResponse::Ok().json(MissedMessagesResponse {
                 messages,
                 count,
@@ -152,6 +160,51 @@ async fn get_missed_messages(req: web::Json<MissedMessagesRequest>) -> ActixResu
         Err(e) => {
             Ok(HttpResponse::InternalServerError().json(json!({
                 "error": format!("Failed to retrieve missed messages: {}", e)
+            })))
+        }
+    }
+}
+
+async fn get_group_messages(req: web::Json<GroupMessagesRequest>) -> ActixResult<HttpResponse> {
+    let archive = match MessageArchive::new().await {
+        Ok(archive) => archive,
+        Err(e) => {
+            return Ok(HttpResponse::InternalServerError().json(json!({
+                "error": format!("Failed to initialize message archive: {}", e)
+            })));
+        }
+    };
+
+    let limit = req.limit.unwrap_or(100).min(500); // Max 500 messages per request
+
+    match archive.get_group_messages(&req.group_id, req.since, limit).await {
+        Ok(events) => {
+            let messages: Vec<ArchivedMessage> = events.into_iter().map(|event| {
+                ArchivedMessage {
+                    id: hex::encode(event.id()),
+                    kind: event.kind() as u32,
+                    content: event.content().to_string(),
+                    tags: event.tags().iter().map(|tag| {
+                        tag.iter().map(|s| s.to_string()).collect()
+                    }).collect(),
+                    created_at: event.created_at() as i64,
+                    pubkey: hex::encode(event.pubkey()),
+                    sig: hex::encode(event.sig()),
+                }
+            }).collect();
+
+            let count = messages.len() as u32;
+            let has_more = count >= limit;
+
+            Ok(HttpResponse::Ok().json(MissedMessagesResponse {
+                messages,
+                count,
+                has_more,
+            }))
+        }
+        Err(e) => {
+            Ok(HttpResponse::InternalServerError().json(json!({
+                "error": format!("Failed to retrieve group messages: {}", e)
             })))
         }
     }
