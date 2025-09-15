@@ -1,6 +1,7 @@
 use crate::Result;
 use clap::Parser;
 use nostr_relay::App;
+use nostr_relay::Extension;
 use std::path::PathBuf;
 use tracing::{info, warn};
 
@@ -75,13 +76,21 @@ pub async fn relay(config: &PathBuf, watch: bool) -> Result<()> {
             info!("Startup backfill disabled by configuration");
         }
     }
+    // Initialize MLS Gateway with loaded settings before adding the extension
+    let mut mls_gateway = nostr_extensions::MlsGateway::new(Default::default());
+    // Apply current settings from App so the gateway picks up config (e.g., Firestore project_id)
+    mls_gateway.setting(&app_data.setting);
+    if let Err(e) = mls_gateway.initialize().await {
+        warn!("MLS Gateway initialization failed: {}", e);
+    }
+
     app_data
         .add_extension(nostr_extensions::Metrics::new())
         .add_extension(nostr_extensions::Auth::new())
         .add_extension(nostr_extensions::Ratelimiter::new())
         .add_extension(nostr_extensions::Count::new(db))
         .add_extension(nostr_extensions::Search::new())
-        .add_extension(nostr_extensions::MlsGateway::new(Default::default()))
+        .add_extension(mls_gateway)
         .add_extension(nostr_extensions::NipService::new())
         .web_server()?
         .await?;
