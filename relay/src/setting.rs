@@ -308,17 +308,29 @@ impl Setting {
     }
 
     /// Parse extension setting.
+    /// Supports both:
+    /// - Top-level tables: [mls_gateway]
+    /// - Nested under extensions: [extensions.mls_gateway]
     pub fn parse_extension<T: DeserializeOwned + Default>(&self, key: &str) -> T {
-        self.extra
-            .get(key)
-            .and_then(|v| {
-                let r = serde_json::from_value::<T>(v.clone());
-                if let Err(err) = &r {
-                    error!(error = err.to_string(), "failed to parse {:?} setting", key);
-                }
-                r.ok()
-            })
-            .unwrap_or_default()
+        // 1) Try top-level extra map (e.g., [mls_gateway])
+        if let Some(v) = self.extra.get(key) {
+            return serde_json::from_value::<T>(v.clone()).unwrap_or_else(|err| {
+                error!(error = err.to_string(), "failed to parse {:?} setting", key);
+                T::default()
+            });
+        }
+
+        // 2) Fallback to nested under "extensions" (e.g., [extensions.mls_gateway])
+        if let Some(ext) = self.extra.get("extensions") {
+            if let Some(v) = ext.get(key) {
+                return serde_json::from_value::<T>(v.clone()).unwrap_or_else(|err| {
+                    error!(error = err.to_string(), "failed to parse extensions.{:?} setting", key);
+                    T::default()
+                });
+            }
+        }
+
+        T::default()
     }
 
     /// save extension setting

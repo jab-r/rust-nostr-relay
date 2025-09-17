@@ -16,11 +16,17 @@ use nostr_relay::db::Event;
 use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use firestore::*;
 use std::env;
 use std::collections::HashSet;
 use tracing::{debug, info, warn, instrument};
 
 /// Archived event data structure for Firestore storage
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TagMap {
+    pub values: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArchivedEvent {
     /// Nostr event ID
@@ -29,8 +35,8 @@ pub struct ArchivedEvent {
     pub kind: u32,
     /// Event content
     pub content: String,
-    /// Event tags
-    pub tags: Vec<Vec<String>>,
+    /// Event tags (stored as array of maps to avoid nested arrays in Firestore)
+    pub tags: Vec<TagMap>,
     /// Event creation timestamp
     pub created_at: i64,
     /// Event author pubkey
@@ -55,6 +61,7 @@ pub struct MessageArchive {
     http_client: HttpClient,
     project_id: String,
     base_url: String,
+    db: FirestoreDb,
 }
 
 impl MessageArchive {
@@ -66,12 +73,14 @@ impl MessageArchive {
 
         let http_client = HttpClient::new();
         let base_url = format!("https://firestore.googleapis.com/v1/projects/{}/databases/(default)/documents", project_id);
+        let db = FirestoreDb::new(&project_id).await?;
 
         info!("Message archive initialized for project: {}", project_id);
         Ok(Self {
             http_client,
             project_id,
             base_url,
+            db,
         })
     }
 
@@ -134,8 +143,8 @@ impl MessageArchive {
             id: hex::encode(event.id()),
             kind: event.kind() as u32,
             content: event.content().to_string(),
-            tags: event.tags().iter().map(|tag| {
-                tag.iter().map(|s| s.to_string()).collect()
+            tags: event.tags().iter().map(|tag| TagMap {
+                values: tag.iter().map(|s| s.to_string()).collect()
             }).collect(),
             created_at: event.created_at() as i64,
             pubkey: hex::encode(event.pubkey()),
@@ -147,26 +156,17 @@ impl MessageArchive {
             expires_at: expires_at.timestamp(),
         };
 
-        // Store in Firestore
-        let access_token = self.get_access_token().await?;
+        // Store in Firestore (using official client)
         let doc_id = format!("{}-{}", event.kind(), hex::encode(event.id()));
-        let url = format!("{}/archived_events/{}", self.base_url, doc_id);
-        
-        let firestore_doc = self.to_firestore_document(&archived_event)?;
-        
-        let response = self.http_client
-            .patch(&url)
-            .header("Authorization", format!("Bearer {}", access_token))
-            .header("Content-Type", "application/json")
-            .json(&firestore_doc)
-            .send()
+        self.db
+            .fluent()
+            .update()
+            .fields(paths!(ArchivedEvent::{id, kind, content, tags, created_at, pubkey, sig, recipients, group_id, group_epoch, archived_at, expires_at}))
+            .in_col("archived_events")
+            .document_id(&doc_id)
+            .object(&archived_event)
+            .execute::<()>()
             .await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response.text().await.unwrap_or_default();
-            return Err(anyhow::anyhow!("Failed to archive event ({}): {}", status, error_text));
-        }
 
         debug!("Archived event {} with {} recipients, expires at {}",
                hex::encode(event.id()), recipients.len(), expires_at);
@@ -501,11 +501,18 @@ impl MessageArchive {
 
     /// Convert archived event back to Nostr event
     fn archived_event_to_nostr_event(&self, archived: &ArchivedEvent) -> Result<Event> {
+        // Reconstruct tags as array-of-arrays for Nostr event shape
+        let tags: Vec<Vec<String>> = archived
+            .tags
+            .iter()
+            .map(|tm| tm.values.clone())
+            .collect();
+
         let event_json = json!({
             "id": archived.id,
             "kind": archived.kind,
             "content": archived.content,
-            "tags": archived.tags,
+            "tags": tags,
             "created_at": archived.created_at,
             "pubkey": archived.pubkey,
             "sig": archived.sig
@@ -515,48 +522,6 @@ impl MessageArchive {
         Ok(event)
     }
 
-    /// Convert ArchivedEvent to Firestore document format
-    fn to_firestore_document(&self, event: &ArchivedEvent) -> Result<Value> {
-        // Base fields
-        let mut doc = json!({
-            "fields": {
-                "id": {"stringValue": event.id},
-                "kind": {"integerValue": event.kind.to_string()},
-                "content": {"stringValue": event.content},
-                "tags": {
-                    "arrayValue": {
-                        "values": event.tags.iter().map(|tag| {
-                            json!({
-                                "arrayValue": {
-                                    "values": tag.iter().map(|s| json!({"stringValue": s})).collect::<Vec<_>>()
-                                }
-                            })
-                        }).collect::<Vec<_>>()
-                    }
-                },
-                "created_at": {"integerValue": event.created_at.to_string()},
-                "pubkey": {"stringValue": event.pubkey},
-                "sig": {"stringValue": event.sig},
-                "recipients": {
-                    "arrayValue": {
-                        "values": event.recipients.iter().map(|r| json!({"stringValue": r})).collect::<Vec<_>>()
-                    }
-                },
-                "archived_at": {"integerValue": event.archived_at.to_string()},
-                "expires_at": {"integerValue": event.expires_at.to_string()}
-            }
-        });
-
-        // Optionally include group_id and group_epoch for MLS group catch-up
-        if let Some(ref gid) = event.group_id {
-            doc["fields"]["group_id"] = json!({"stringValue": gid});
-        }
-        if let Some(epoch) = event.group_epoch {
-            doc["fields"]["group_epoch"] = json!({"integerValue": epoch.to_string()});
-        }
-
-        Ok(doc)
-    }
 
     /// Convert Firestore fields to ArchivedEvent
     fn from_firestore_fields(&self, fields: &Value) -> Result<ArchivedEvent> {
@@ -592,19 +557,29 @@ impl MessageArchive {
             Ok(result)
         };
 
-        // Parse tags (array of arrays)
-        let tags = if let Some(tags_value) = fields.get("tags").and_then(|v| v.get("arrayValue")).and_then(|v| v.get("values")) {
-            let mut result = Vec::new();
-            if let Some(tags_array) = tags_value.as_array() {
-                for tag_value in tags_array {
-                    if let Some(tag_array) = tag_value.get("arrayValue").and_then(|v| v.get("values")).and_then(|v| v.as_array()) {
-                        let mut tag = Vec::new();
-                        for item in tag_array {
-                            if let Some(s) = item.get("stringValue").and_then(|v| v.as_str()) {
-                                tag.push(s.to_string());
+        // Parse tags as array of maps, each containing a 'values' array (avoids nested arrays in Firestore)
+        let tags = if let Some(arr) = fields
+            .get("tags")
+            .and_then(|v| v.get("arrayValue"))
+            .and_then(|v| v.get("values"))
+            .and_then(|v| v.as_array())
+        {
+            let mut result: Vec<TagMap> = Vec::new();
+            for item in arr {
+                if let Some(map_fields) = item.get("mapValue").and_then(|v| v.get("fields")) {
+                    if let Some(values_arr) = map_fields
+                        .get("values")
+                        .and_then(|v| v.get("arrayValue"))
+                        .and_then(|v| v.get("values"))
+                        .and_then(|v| v.as_array())
+                    {
+                        let mut vals: Vec<String> = Vec::new();
+                        for v in values_arr {
+                            if let Some(s) = v.get("stringValue").and_then(|x| x.as_str()) {
+                                vals.push(s.to_string());
                             }
                         }
-                        result.push(tag);
+                        result.push(TagMap { values: vals });
                     }
                 }
             }

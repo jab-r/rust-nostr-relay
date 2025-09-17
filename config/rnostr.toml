@@ -79,6 +79,17 @@ api_prefix = "/api/v1"
 enable_message_archive = true
 message_archive_ttl_days = 30
 
+# Fields added to satisfy newer config schema; safe defaults
+enable_in_process_decrypt = true
+preferred_service_handler = "in-process"
+gating_use_registry_hint = false
+# mls_service_user_id = ""  # optional; set only if using nip_service_mls
+
+# Startup backfill controls
+backfill_on_startup = true
+backfill_kinds = [445, 1059, 446]
+backfill_max_events = 50000
+
 # New configuration for kinds 447 (KeyPackage Request) and 450 (Roster/Policy)
 # System pubkey for KeyPackage requests (optional - if not set, only admin_pubkeys can request)
 # system_pubkey = "your_system_relay_pubkey_hex"

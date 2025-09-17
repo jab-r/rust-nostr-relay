@@ -63,6 +63,7 @@ impl Default for StorageType {
 
 /// MLS Gateway Extension configuration
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
 pub struct MlsGatewayConfig {
     /// Storage backend to use
     pub storage_backend: StorageType,
@@ -360,9 +361,21 @@ impl MlsGateway {
         let store = match self.config.storage_backend {
             #[cfg(feature = "mls_gateway_firestore")]
             StorageType::Firestore => {
-                let project_id = self.config.project_id.as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("project_id required for Firestore backend"))?;
-                let firestore_store = firestore::FirestoreStorage::new(project_id).await?;
+                // Determine project_id from config or environment
+                let project_id = if let Some(pid) = self.config.project_id.clone() {
+                    pid
+                } else if let Ok(pid) = std::env::var("MLS_FIRESTORE_PROJECT_ID") {
+                    pid
+                } else if let Ok(pid) = std::env::var("GOOGLE_CLOUD_PROJECT") {
+                    pid
+                } else if let Ok(pid) = std::env::var("GCP_PROJECT") {
+                    pid
+                } else {
+                    return Err(anyhow::anyhow!(
+                        "project_id required for Firestore backend (set extensions.mls_gateway.project_id or MLS_FIRESTORE_PROJECT_ID/GOOGLE_CLOUD_PROJECT/GCP_PROJECT env)"
+                    ));
+                };
+                let firestore_store = firestore::FirestoreStorage::new(&project_id).await?;
                 firestore_store.migrate().await?;
                 StorageBackend::Firestore(Arc::new(firestore_store))
             },
@@ -531,18 +544,17 @@ impl MlsGateway {
             .find(|tag| tag.len() >= 2 && tag[0] == "h")
             .map(|tag| tag[1].clone());
             
-        if let (Some(recipient), Some(group_id)) = (recipient, group_id) {
-            // This represents a group invitation - update membership
-            // Per spec: "When a Giftwrap (1059) for p=invitee arrives, relay marks invitee as a member"
-            info!("Processing group invitation via Giftwrap: recipient={}, group={}", recipient, group_id);
-            
-            // Mark recipient as group member (simplified approach)
-            // In production, this might need more sophisticated membership tracking
+        if let Some(recipient) = recipient {
+            // Process giftwrap for recipient; group_id is optional per NIP-59/NIP-EE
+            info!("Processing Giftwrap for recipient={}, group_hint={:?}", recipient, group_id);
+            // Membership update is best-effort; in practice handled by clients post-decrypt
             counter!("mls_gateway_membership_updates").increment(1);
-            
-            info!("Added {} to group {} via Giftwrap invitation", recipient, group_id);
+            if let Some(ref gid) = group_id {
+                info!("Giftwrap hints group {} for {}", gid, recipient);
+            }
         } else {
-            warn!("Giftwrap missing required p (recipient) or h (group_id) tags");
+            // NIP-59 requires a 'p' tag for recipient routing; warn if missing
+            warn!("Giftwrap missing required p (recipient) tag");
         }
         
         counter!("mls_gateway_giftwarps_processed").increment(1);
@@ -937,7 +949,7 @@ impl Extension for MlsGateway {
                             }
                         }
 
-                        // Extract recipient and group ID from tags
+                        // Extract recipient and optional group hint from tags
                         let recipient = event_clone.tags().iter()
                             .find(|tag| tag.len() >= 2 && tag[0] == "p")
                             .map(|tag| tag[1].clone());
@@ -946,18 +958,16 @@ impl Extension for MlsGateway {
                             .find(|tag| tag.len() >= 2 && tag[0] == "h")
                             .map(|tag| tag[1].clone());
                             
-                        if let (Some(recipient), Some(group_id)) = (recipient, group_id) {
-                            // This represents a group invitation - update membership
-                            // Per spec: "When a Giftwrap (1059) for p=invitee arrives, relay marks invitee as a member"
-                            info!("Processing group invitation via Giftwrap: recipient={}, group={}", recipient, group_id);
-                            
-                            // Mark recipient as group member (simplified approach)
-                            // In production, this might need more sophisticated membership tracking
+                        if let Some(recipient) = recipient {
+                            // Best-effort membership/accounting; clients handle formal join post-decrypt
+                            info!("Processing Giftwrap for recipient={}, group_hint={:?}", recipient, group_id);
                             counter!("mls_gateway_membership_updates").increment(1);
-                            
-                            info!("Added {} to group {} via Giftwrap invitation", recipient, group_id);
+                            if let Some(ref gid) = group_id {
+                                info!("Giftwrap hints group {} for {}", gid, recipient);
+                            }
                         } else {
-                            warn!("Giftwrap missing required p (recipient) or h (group_id) tags");
+                            // NIP-59 requires 'p'; if absent, we still archived earlier but warn here
+                            warn!("Giftwrap missing required p (recipient) tag");
                         }
                         
                         counter!("mls_gateway_giftwarps_processed").increment(1);
@@ -1089,7 +1099,10 @@ impl MlsGateway {
         // Outer tag hygiene (non-sensitive): warn on unexpected tags per NIP-EE (allow only "h" and optional "k")
         let unexpected_tag_count = event.tags().iter()
             .filter(|tag| !tag.is_empty())
-            .filter(|tag| tag[0] != "h" && tag[0] != "k")
+            .filter(|tag| {
+                let key = &tag[0];
+                !(key == "h" || key == "k" || key == "mls_ver")
+            })
             .count();
         if unexpected_tag_count > 0 {
             warn!("kind 445 contains non-standard outer tags: count={}", unexpected_tag_count);
