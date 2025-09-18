@@ -43,7 +43,7 @@ Key Decisions (Validated in Implementation)
 Stakeholders and Components
 - rust-nostr-relay: Control-plane relay with MLS group routing and the service-member role (in-process optional).
 - loxation-server: Validation plane for MACVerify and version-aware acceptance (current → previous grace).
-- react-native-mls: Admin operator client; MLS member; initiates actions and receives sensitive MLS notifications.
+- loxation-mls: Admin operator client; MLS member; initiates actions and receives sensitive MLS notifications.
 - Firestore/DB: Persistent audit and state for actions, versioned secrets metadata, and pointers.
 
 Security & Compliance Posture

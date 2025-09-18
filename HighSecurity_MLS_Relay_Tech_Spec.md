@@ -1,7 +1,7 @@
 # High-Security MLS-over-Nostr Relay
 Technical Specification for vendored rnostr (rust-nostr-relay) deployment on Google Cloud Run, with MLS gateway features and loxation-messenger replacement.
 
-Author: react-native-mls
+Author: loxation-mls
 Status: Draft
 Target: Relay/Platform teams
 

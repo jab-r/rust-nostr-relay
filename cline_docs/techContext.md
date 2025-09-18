@@ -8,7 +8,7 @@ Languages, Frameworks, and Libraries
   - MLS Gateway (extensions/src/mls_gateway): event handling for kinds 443/444/445/446/447/450, registry, optional archival
   - NIP-SERVICE (extensions/src/nip_service): service-request/notify/ack plumbing and profile routing
 - MLS layer (planned integration):
-  - react_native_mls_rust::api::MlsClient (OpenMLS-based) providing:
+  - loxation_mls_mls_rust::api::MlsClient (OpenMLS-based) providing:
     - has_group(user_id, group_id) (fast in-memory membership)
     - decrypt/encrypt application messages
   - SQLCipher-backed SQLite storage for server-side MLS state (on Cloud Run with GCS Fuse)

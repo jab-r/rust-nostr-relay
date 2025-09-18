@@ -2,7 +2,7 @@
 //! Service Member adapter (stub) for MLS-first NIP-SERVICE path.
 //!
 //! This module is compiled only when the `nip_service_mls` feature is enabled.
-//! It will eventually own the RN MLS client (react_native_mls_rust::api::MlsClient) and
+//! It will eventually own the RN MLS client (loxation_mls_mls_rust::api::MlsClient) and
 //! provide decrypt/encrypt helpers for MLS application messages.
 //!
 //! For now, we provide a safe stub that never leaks plaintext. It only attempts to parse

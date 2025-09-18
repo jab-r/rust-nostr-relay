@@ -7,7 +7,7 @@ Status
 - Target projects:
   - rust-nostr-relay (service control-plane + MLS service member)
   - loxation-server (validation/execution plane for applicable actions)
-  - react-native-mls (admin/operator client; MLS membership)
+  - loxation-mls (admin/operator client; MLS membership)
 
 Abstract
 NIP-SERVICE defines a general protocol for enabling a server-side service account to participate in MLS-backed, operator-initiated workflows over a Nostr control plane. It standardizes how “service actions” are requested, authorized, executed, and audited, while ensuring sensitive payloads are distributed only via MLS to authorized group members. The Rotation profile (NIP-KR) is the first concrete action; additional action profiles (e.g., policy updates, escrow, notifications) can be added without changing the core.

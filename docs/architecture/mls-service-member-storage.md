@@ -12,7 +12,7 @@ Context: NIP-KR rotate-notify requires the relay to act as an MLS “service mem
 
 ## Why not Cloud SQL?
 
-- The react_native_mls_rust crate’s storage is based on `openmls_sqlite_storage` (SQLite). Cloud SQL is a networked Postgres/MySQL; you cannot point SQLite at Cloud SQL.
+- The loxation_mls_mls_rust crate’s storage is based on `openmls_sqlite_storage` (SQLite). Cloud SQL is a networked Postgres/MySQL; you cannot point SQLite at Cloud SQL.
 - A Cloud SQL-based OpenMLS storage provider would require a new implementation similar in scope to `openmls_sqlite_storage`—significant engineering work.
 - That work yields little ROI for the “service member” use case; we just need durable, local file-backed state.
 
@@ -96,7 +96,7 @@ mls_service_sqlcipher_kms_key = "projects/…/locations/global/keyRings/…/cryp
 ## Minimal Code Sketch (where used)
 
 ```rust
-use react_native_mls_rust::api::MlsClient;
+use loxation_mls_mls_rust::api::MlsClient;
 
 fn init_service_member(client: &MlsClient, storage_path: &str, sqlcipher_key: &str) -> anyhow::Result<()> {
     client.set_storage_path(storage_path)?;

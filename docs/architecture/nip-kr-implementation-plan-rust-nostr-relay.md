@@ -82,7 +82,7 @@ Data Model (Firestore)
 
 Integration Points
 
-1) MLS/Nostr Rust module integration (../react-native-mls/rust)
+1) MLS/Nostr Rust module integration (../loxation-mls/rust)
 - Goal: Use the existing Rust MLS/Nostr module to compose and send MLS group payloads to the admin group(s) for a given client_id.
 - Approach:
   - Add as a path dependency in the relay workspace (exact crate name TBD after audit). If not suitable as direct dependency, vendor a minimal sender API into a sub-crate.
@@ -246,7 +246,7 @@ M3: Nostr event handling + Policy (3–4 days)
 - Policy enforcement (Δ min, grace bounds, rate limits, idempotency)
 
 M4: MLS rotate-notify integration (3–5 days)
-- Integrate MlsNotifier with ../react-native-mls/rust
+- Integrate MlsNotifier with ../loxation-mls/rust
 - Send rotate-notify payload to admin group(s) for client_id
 - Capture relay_msg_id and audit in Firestore
 
@@ -287,7 +287,7 @@ E2E
 - Concurrent rotations: Reject with conflict; rely on rotation_id idempotency
 
 15) Open Items for Team Decision
-- Exact crate/module name and API surface for ../react-native-mls/rust integration
+- Exact crate/module name and API surface for ../loxation-mls/rust integration
 - mac_key_ref storage: full cryptoKeyVersion vs logical label + mapping
 - Default quorum for sensitive clients (2+ or majority?)
 - Whether relay issues nonce vs trusting loxation-server-issued nonce
@@ -325,10 +325,10 @@ Appendix C — Metrics names
 - nip_kr_acks_total
 - nip_kr_errors_total{class}
 
-Suitability Assessment: ../react-native-mls/rust
+Suitability Assessment: ../loxation-mls/rust
 
 Summary
-- Crate: react_native_mls_rust v0.1.4 (edition 2021), library outputs: rlib, cdylib, staticlib. Suitable for direct Rust integration (no FFI required) inside rust-nostr-relay.
+- Crate: loxation_mls_mls_rust v0.1.4 (edition 2021), library outputs: rlib, cdylib, staticlib. Suitable for direct Rust integration (no FFI required) inside rust-nostr-relay.
 - Public API: src/api.rs exposes a Rust-native MlsClient with:
   - create_application_message/encrypt_message/decrypt_message
   - group create/join/add/remove/commit/self_update
@@ -368,7 +368,7 @@ Gaps and mitigations
 
 Conclusion
 - Suitability: YES, with the service-member model. The crate exposes all required primitives to generate MLS application messages and manage local state. No immediate need to implement NIP-44 for NIP-KR delivery.
-- Action: Implement MlsNotifier using react_native_mls_rust::api::MlsClient and connect to the relay writer to emit kind 445 messages scoped to the admin group(s).
+- Action: Implement MlsNotifier using loxation_mls_mls_rust::api::MlsClient and connect to the relay writer to emit kind 445 messages scoped to the admin group(s).
 
 Review Checklist
 - Validate the module structure and trait boundaries (MacSigner, MlsNotifier)

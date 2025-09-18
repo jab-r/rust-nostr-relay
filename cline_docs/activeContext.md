@@ -40,7 +40,7 @@ Open Gaps / Next Steps (Implementation)
      - enable_in_process_decrypt (bool), preferred_service_handler (string), gating_use_registry_hint (bool), mls_service_user_id (string).
    - Apply values in Extension::setting and call initialize() as needed.
 2) RN MLS integration (feature: nip_service_mls):
-   - Add react_native_mls_rust dependency (optional) and guarded code.
+   - Add loxation_mls_mls_rust dependency (optional) and guarded code.
    - Implement service_member::has_group using MlsClient’s in-memory registry (constant-time check).
    - Implement decrypt_application(event_445) to decrypt MLS ciphertext and return JSON payload.
    - Implement encrypt_application(group_id, payload) for outbound MLS service-notify.

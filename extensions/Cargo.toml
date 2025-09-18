@@ -39,7 +39,7 @@ hmac = "0.12"
 sha2 = "0.10"
 rand = "0.8"
 once_cell = "1.19.0"
-# Optional RN MLS crate for service-member decrypt/dispatch (MLS-first NIP-SERVICE path)
+# Optional LOXATION MLS crate for service-member decrypt/dispatch (MLS-first NIP-SERVICE path)
 
 [features]
 default = ["metrics", "rate_limiter", "count", "search", "mls_gateway", "nip_service"]

@@ -10,7 +10,7 @@ Provide a secure, automated, and auditable architecture to eliminate long-lived 
 In-scope systems
 - loxation-server (this repo): OAuth2 validation, /external-totp interfaces
 - rust-nostr-relay (../rust-nostr-relay): Control plane for rotation, MLS distribution
-- react-native-mls (../react-native-mls): Admin mobile client, MLS membership
+- loxation-mls (../loxation-mls): Admin mobile client, MLS membership
 - Firestore (shared): Versioned secret metadata storage, audit logs
 - KMS/Secret Manager: Non-exportable MAC key (HMAC-SHA-256) for hashing (mac_key_ref)
 - External clients: Service-to-service integrators using OAuth2 client credentials
@@ -225,7 +225,7 @@ Integration with /external-totp
 Deployment and cross-repo alignment
 - This repo (loxation-server): implement version-aware client credential verification; no plaintext storage; caching and metrics.
 - ../rust-nostr-relay: implement NIP-KR rotation service, MLS distribution, Firestore writes, audit logging.
-- ../react-native-mls: admin UX, mobile TOTP, App Attest-bound npub, rotate-request with jwt_proof.
+- ../loxation-mls: admin UX, mobile TOTP, App Attest-bound npub, rotate-request with jwt_proof.
 - Firestore (shared): central metadata and audit.
 - KMS/Secret Manager: maintain non-exportable HMAC key(s); reference as mac_key_ref.
 

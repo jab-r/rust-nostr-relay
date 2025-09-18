@@ -3,7 +3,7 @@
 Related assets
 - Existing APIs: `docs/api/oauth2.md`, `docs/api/external-totp.md`
 - Prior work: `../MLShardenedAD/docs` (follow-on deliverable)
-- Upstream projects: `../rust-nostr-relay` (MLS + Nostr relay), `../react-native-mls` (MLS mobile client)
+- Upstream projects: `../rust-nostr-relay` (MLS + Nostr relay), `../loxation-mls` (MLS mobile client)
 
 ## Problem statement
 
@@ -25,7 +25,7 @@ Leaked OAuth2 client_secrets or X-API keys can enable unauthorized access to sen
 ## Scope
 
 - OAuth2 client_secret and X-API secret rotation for services that authenticate to loxation-server, including `/external-totp`.
-- Admins are MLS “admin” group members using `../react-native-mls`.
+- Admins are MLS “admin” group members using `../loxation-mls`.
 - Control plane implementation resides in `../rust-nostr-relay` (already integrated with Nostr/WebSocket and MLS).
 - Shared Firestore is the source of truth for versioned secret metadata and audit records.
 
@@ -56,7 +56,7 @@ This design aligns explicitly with current device attestation/registration, mobi
 
 - Admin identity for rotations
   - Identity source of truth: Firebase (same project used by rust-nostr-relay).
-  - Admin group: Operators who are members of the MLS "admin" group (via ../react-native-mls) AND who present fresh device integrity and user presence signals.
+  - Admin group: Operators who are members of the MLS "admin" group (via ../loxation-mls) AND who present fresh device integrity and user presence signals.
   - Attested Admin Token: When an admin initiates a rotation, the mobile app:
     1) Performs a current App Attest assertion (proving device/app integrity tied to the stored npub)
     2) Completes a mobile TOTP step (user presence)
@@ -202,7 +202,7 @@ stateDiagram-v2
 
 - New rotation service that:
   - Accepts `rotate-request` over existing Nostr/WebSocket.
-  - Verifies admin MLS membership (`../react-native-mls`) and validates `jwt_proof` via loxation-server JWKS (mandatory).
+  - Verifies admin MLS membership (`../loxation-mls`) and validates `jwt_proof` via loxation-server JWKS (mandatory).
   - Generates 32-byte random secret (base64url), `version_id` (ULID/UUID), computes `secret_hash` via KMS MACSign using canonical input.
   - Two-phase promotion:
     - Prepare: create secret with `state=pending`, set `not_before = now + Δ` (Δ ≥ 10 minutes by policy), distribute plaintext via MLS to per-client authorized admin group(s); await ack quorum or explicit admin confirmation.
@@ -216,7 +216,7 @@ stateDiagram-v2
   - Zero plaintext logging; memory-scrub secret buffers.
   - Circuit breaker if too many failed rotate attempts.
 
-## Admin app changes (`../react-native-mls`)
+## Admin app changes (`../loxation-mls`)
 
 - New UI flow: “Rotate OAuth2/X-API Secret”
   - Authenticate via mobile-totp to loxation-server; obtain JWT.

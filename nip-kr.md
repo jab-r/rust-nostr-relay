@@ -6,7 +6,7 @@ Status
 - Target projects:
   - rust-nostr-relay (rotation control plane, MLS distribution)
   - loxation-server (OAuth2/X-API secret validation; grace windows)
-  - react-native-mls (admin operator client)
+  - loxation-mls (admin operator client)
 - Related docs:
   - high-level-architecture-automatic-api-key-rotation.md
   - oauth2-mls-key-rotation-implementation-plan.md

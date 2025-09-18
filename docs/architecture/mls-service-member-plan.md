@@ -32,7 +32,7 @@ High-Level Design
 Key Components
 
 1) ServiceMemberAgent (new: `extensions/src/mls_gateway/service_member.rs`)
-- Owns a singleton instance of `react_native_mls_rust::api::MlsClient` for the service identity.
+- Owns a singleton instance of `loxation_mls_mls_rust::api::MlsClient` for the service identity.
 - Responsibilities:
   - init(storage_path, sqlcipher_key) → set up durable MLS state (SQLite + SQLCipher); lazy-initialized (once_cell).
   - publish_keypackages(n) → generate and output kind 443 KeyPackages for onboarding or refresh.
