@@ -949,28 +949,6 @@
       ]
     },
     {
-      "collectionGroup": "mls_keypackages",
-      "queryScope": "COLLECTION",
-      "fields": [
-        {
-          "fieldPath": "recipient_pubkey",
-          "order": "ASCENDING"
-        },
-        {
-          "fieldPath": "picked_up_at",
-          "order": "ASCENDING"
-        },
-        {
-          "fieldPath": "expires_at",
-          "order": "ASCENDING"
-        },
-        {
-          "fieldPath": "created_at",
-          "order": "ASCENDING"
-        }
-      ]
-    },
-    {
       "collectionGroup": "mls_welcomes",
       "queryScope": "COLLECTION",
       "fields": [
@@ -1107,6 +1085,41 @@
         {
           "fieldPath": "expires_at",
           "order": "ASCENDING"
+        }
+      ]
+    },
+
+    {
+      "collectionGroup": "mls_groups",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "group_id",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "keypackage_relays",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "owner_pubkey",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "roster_policy",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "group_id",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "sequence",
+          "order": "DESCENDING"
         }
       ]
     }

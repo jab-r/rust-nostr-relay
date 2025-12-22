@@ -11,6 +11,7 @@ use std::{
 
 mod bench;
 mod relay;
+pub mod cleanup;
 
 pub use bench::*;
 pub use relay::*;

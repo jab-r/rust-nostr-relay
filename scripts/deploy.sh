@@ -173,9 +173,73 @@ fi
 
 echo ""
 echo "🚀 MLS Secure Relay deployed successfully!"
+
+# Deploy Cloud Run Job for keypackage cleanup
+echo ""
+echo "Setting up Cloud Run Job for keypackage cleanup..."
+
+JOB_NAME="${SERVICE_NAME}-cleanup"
+SCHEDULE_NAME="${JOB_NAME}-schedule"
+
+# Create or update the Cloud Run Job
+echo "Creating/updating Cloud Run Job: ${JOB_NAME}"
+gcloud run jobs replace ${JOB_NAME} \
+  --image gcr.io/${PROJECT_ID}/${SERVICE_NAME}:${TAG} \
+  --args "cleanup" \
+  --region ${REGION} \
+  --project ${PROJECT_ID} \
+  --service-account ${SERVICE_ACCOUNT} \
+  --parallelism 1 \
+  --task-timeout 5m \
+  --max-retries 1 \
+  --memory 512Mi \
+  --cpu 1 \
+  --set-env-vars="${ENV_VARS}" \
+  2>/dev/null || \
+gcloud run jobs create ${JOB_NAME} \
+  --image gcr.io/${PROJECT_ID}/${SERVICE_NAME}:${TAG} \
+  --args "cleanup" \
+  --region ${REGION} \
+  --project ${PROJECT_ID} \
+  --service-account ${SERVICE_ACCOUNT} \
+  --parallelism 1 \
+  --task-timeout 5m \
+  --max-retries 1 \
+  --memory 512Mi \
+  --cpu 1 \
+  --set-env-vars="${ENV_VARS}"
+
+# Get the job URI for the scheduler
+JOB_URI="https://${REGION}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${NAMESPACE}/jobs/${JOB_NAME}:run"
+
+# Create or update the Cloud Scheduler job
+echo "Setting up Cloud Scheduler: ${SCHEDULE_NAME}"
+gcloud scheduler jobs update http ${SCHEDULE_NAME} \
+  --location ${REGION} \
+  --schedule "0 2 * * *" \
+  --time-zone "America/New_York" \
+  --uri "${JOB_URI}" \
+  --http-method POST \
+  --oauth-service-account-email ${SERVICE_ACCOUNT} \
+  2>/dev/null || \
+gcloud scheduler jobs create http ${SCHEDULE_NAME} \
+  --location ${REGION} \
+  --schedule "0 2 * * *" \
+  --time-zone "America/New_York" \
+  --uri "${JOB_URI}" \
+  --http-method POST \
+  --oauth-service-account-email ${SERVICE_ACCOUNT}
+
+echo "✅ Cloud Run Job and Scheduler configured successfully"
+
+echo ""
 echo "📊 Monitor logs: gcloud logs tail --follow projects/${PROJECT_ID}/services/${SERVICE_NAME}"
 echo "🔧 Service URL: ${SERVICE_URL}"
+echo "🧹 Cleanup job: ${JOB_NAME} (runs daily at 2 AM ET)"
+echo ""
+echo "To test the cleanup job manually:"
+echo "  gcloud run jobs execute ${JOB_NAME} --region ${REGION}"
 echo ""
 echo "Next steps:"
-echo "1. Configure Cloud SQL database with MLS Gateway schema"
-echo "2. Set up pubkey allowlists in the configuration"
+echo "1. Deploy Firestore indexes: firebase deploy --only firestore:indexes"
+echo "2. Configure pubkey allowlists in the configuration"

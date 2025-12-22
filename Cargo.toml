@@ -38,7 +38,7 @@ serde_json = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 
 [features]
-default = ["mls_gateway", "nip_service"]
+default = ["mls_gateway", "nip_service", "nip_service_mls"]
 mls_gateway = ["nostr-extensions/mls_gateway"]
 mls_gateway_firestore = ["nostr-extensions/mls_gateway_firestore"]
 mls_gateway_sql = ["nostr-extensions/mls_gateway_sql"]

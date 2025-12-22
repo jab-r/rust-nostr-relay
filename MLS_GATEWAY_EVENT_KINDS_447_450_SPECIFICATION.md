@@ -15,10 +15,11 @@ Both kinds are designed to enhance the robustness and consistency of MLS group m
 ## Kind 447: KeyPackage Request
 
 ### Purpose
-Enable relay systems or administrators to request fresh KeyPackages from specific users via Nostr, facilitating:
-- Commodity relay interoperability (not just gateway WebSocket/REST)
-- Background replenishment across devices
-- Per-group or generic requests with constraints
+Enable authenticated users to request KeyPackages from other users via Nostr, which is essential for:
+- Creating MLS groups (need keypackages to add members)
+- Adding new members to existing groups
+- Cross-relay interoperability
+- Background replenishment when keypackages are consumed
 
 ### Schema
 

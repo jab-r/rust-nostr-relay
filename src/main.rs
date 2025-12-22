@@ -29,6 +29,8 @@ enum Commands {
     Relay(RelayOpts),
     /// Delete data by filter
     Delete(DeleteOpts),
+    /// Clean up expired keypackages
+    Cleanup,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -54,6 +56,15 @@ fn main() -> anyhow::Result<()> {
             } else {
                 println!("Deleted {} events", count);
             }
+        }
+        Commands::Cleanup => {
+            // Initialize tracing for logging
+            tracing_subscriber::fmt::init();
+            
+            // Run cleanup in async context
+            tokio::runtime::Runtime::new()?.block_on(async {
+                rnostr::cleanup::run_cleanup().await
+            })?;
         }
     }
     Ok(())

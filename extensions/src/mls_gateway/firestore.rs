@@ -50,6 +50,21 @@ struct KeypackageRelays {
     pub updated_at: DateTime<Utc>,
 }
 
+/// KeyPackage document structure for Firestore
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct KeyPackageDoc {
+    pub event_id: String,
+    pub owner_pubkey: String,
+    pub content: String,
+    pub ciphersuite: String,
+    pub extensions: Vec<String>,
+    pub relays: Vec<String>,
+    #[serde(with = "chrono::serde::ts_seconds")]
+    pub created_at: DateTime<Utc>,
+    #[serde(with = "chrono::serde::ts_seconds")]
+    pub expires_at: DateTime<Utc>,
+}
+
 /// Firestore storage implementation
 #[derive(Debug)]
 pub struct FirestoreStorage {
@@ -139,7 +154,7 @@ impl FirestoreStorage {
             .in_col("mls_groups")
             .document_id(group_id)
             .object(&group)
-            .execute()
+            .execute::<()>()
             .await?;
 
         info!("Updated group registry: {}", group_id);
@@ -164,6 +179,42 @@ impl FirestoreStorage {
     /// Returns true if the group is flagged to contain a service member
     pub async fn has_service_member(&self, group_id: &str) -> Result<bool> {
         Ok(self.fetch_group(group_id).await?.map(|g| g.service_member).unwrap_or(false))
+    }
+    
+    /// Clean up expired keypackages - should be run daily
+    pub async fn cleanup_expired_keypackages(&self) -> Result<u32> {
+        let now = Utc::now();
+        info!("Starting cleanup of expired keypackages");
+        
+        // Query for expired keypackages
+        let expired_docs = self.db
+            .fluent()
+            .select()
+            .from("mls_keypackages")
+            .filter(|f| f.field("expires_at").less_than_or_equal(now))
+            .query()
+            .await?;
+        
+        let mut deleted = 0;
+        for doc in expired_docs {
+            if let Ok(kp) = firestore::FirestoreDb::deserialize_doc_to::<KeyPackageDoc>(&doc) {
+                // Delete the expired keypackage
+                if let Ok(_) = self.db
+                    .fluent()
+                    .delete()
+                    .from("mls_keypackages")
+                    .document_id(&kp.event_id)
+                    .execute()
+                    .await
+                {
+                    deleted += 1;
+                    info!("Deleted expired keypackage {} for owner {}", kp.event_id, kp.owner_pubkey);
+                }
+            }
+        }
+        
+        info!("Cleanup complete: deleted {} expired keypackages", deleted);
+        Ok(deleted)
     }
 }
 
@@ -225,7 +276,7 @@ impl MlsStorage for FirestoreStorage {
             .in_col("mls_groups")
             .document_id(group_id)
             .object(&patch)
-            .execute()
+            .execute::<()>()
             .await?;
         Ok(())
     }
@@ -242,7 +293,7 @@ impl MlsStorage for FirestoreStorage {
             .in_col("mls_groups")
             .document_id(group_id)
             .object(&patch)
-            .execute()
+            .execute::<()>()
             .await?;
         Ok(())
     }
@@ -314,7 +365,7 @@ impl MlsStorage for FirestoreStorage {
             .into(collection)
             .document_id(&doc_id)
             .object(&doc)
-            .execute()
+            .execute::<()>()
             .await?;
             
         info!("Stored roster/policy event: group={}, seq={}, op={}", group_id, sequence, operation);
@@ -335,7 +386,7 @@ impl MlsStorage for FirestoreStorage {
             .in_col("keypackage_relays")
             .document_id(owner_pubkey)
             .object(&rec)
-            .execute()
+            .execute::<()>()
             .await?;
 
         info!("Upserted KeyPackage relays list for owner {}", owner_pubkey);
@@ -358,6 +409,200 @@ impl MlsStorage for FirestoreStorage {
             .collect();
 
         Ok(items.pop().map(|k| k.relays).unwrap_or_default())
+    }
+
+    async fn store_keypackage(
+        &self,
+        event_id: &str,
+        owner_pubkey: &str,
+        content: &str,
+        ciphersuite: &str,
+        extensions: &[String],
+        relays: &[String],
+        _has_last_resort: bool,
+        created_at: i64,
+        expires_at: i64,
+    ) -> anyhow::Result<()> {
+        // Note: has_last_resort parameter is now ignored since we use
+        // "last remaining" approach instead of explicit last resort extension
+        let doc = KeyPackageDoc {
+            event_id: event_id.to_string(),
+            owner_pubkey: owner_pubkey.to_string(),
+            content: content.to_string(),
+            ciphersuite: ciphersuite.to_string(),
+            extensions: extensions.to_vec(),
+            relays: relays.to_vec(),
+            created_at: DateTime::from_timestamp(created_at, 0).unwrap_or_else(Utc::now),
+            expires_at: DateTime::from_timestamp(expires_at, 0).unwrap_or_else(Utc::now),
+        };
+
+        self.db
+            .fluent()
+            .insert()
+            .into("mls_keypackages")
+            .document_id(event_id)
+            .object(&doc)
+            .execute::<()>()
+            .await?;
+
+        info!("Stored keypackage {} for owner {}", event_id, owner_pubkey);
+        Ok(())
+    }
+
+    async fn query_keypackages(
+        &self,
+        authors: Option<&[String]>,
+        _since: Option<i64>, // Ignored - not needed for keypackage queries
+        limit: Option<u32>,
+    ) -> anyhow::Result<Vec<(String, String, String, i64)>> {
+        let mut query = self.db
+            .fluent()
+            .select()
+            .from("mls_keypackages");
+
+        // Filter by authors if specified
+        if let Some(author_list) = authors {
+            if !author_list.is_empty() {
+                query = query.filter(|f| f.field("owner_pubkey").is_in(author_list));
+            }
+        }
+
+        // Apply limit
+        let limit_val = limit.unwrap_or(100).min(1000) as u32;
+        query = query.limit(limit_val);
+
+        // Simple query - no ordering, no expiration filtering
+        // Expired keypackages are cleaned up by a separate daily job
+        let docs = query.query().await?;
+        let keypackages: Vec<(String, String, String, i64)> = docs
+            .into_iter()
+            .filter_map(|doc| {
+                firestore::FirestoreDb::deserialize_doc_to::<KeyPackageDoc>(&doc).ok()
+                    .map(|kp| (kp.event_id, kp.owner_pubkey, kp.content, kp.created_at.timestamp()))
+            })
+            .collect();
+
+        Ok(keypackages)
+    }
+
+    async fn delete_consumed_keypackage(&self, event_id: &str) -> anyhow::Result<bool> {
+        // First get the keypackage to find its owner
+        let docs = self.db
+            .fluent()
+            .select()
+            .from("mls_keypackages")
+            .filter(|f| f.field("event_id").eq(event_id))
+            .limit(1)
+            .query()
+            .await?;
+
+        if let Some(doc) = docs.into_iter().next() {
+            if let Ok(kp) = firestore::FirestoreDb::deserialize_doc_to::<KeyPackageDoc>(&doc) {
+                // Count how many valid keypackages this user has
+                let count = self.count_user_keypackages(&kp.owner_pubkey).await?;
+                
+                if count <= 1 {
+                    // This is the last keypackage for the user - preserve it
+                    info!("Preserving last remaining keypackage {} for user {}", event_id, kp.owner_pubkey);
+                    return Ok(false);
+                }
+                
+                // Safe to delete - user has other keypackages
+                self.db
+                    .fluent()
+                    .delete()
+                    .from("mls_keypackages")
+                    .document_id(event_id)
+                    .execute()
+                    .await?;
+
+                info!("Deleted consumed keypackage {} for user {} (remaining: {})",
+                      event_id, kp.owner_pubkey, count - 1);
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    async fn count_user_keypackages(&self, owner_pubkey: &str) -> anyhow::Result<u32> {
+        let now = Utc::now();
+        let docs = self.db
+            .fluent()
+            .select()
+            .from("mls_keypackages")
+            .filter(|f| f.field("owner_pubkey").eq(owner_pubkey))
+            .filter(|f| f.field("expires_at").greater_than(now))
+            .query()
+            .await?;
+
+        Ok(docs.len() as u32)
+    }
+
+    async fn cleanup_expired_keypackages(&self) -> anyhow::Result<u32> {
+        let now = Utc::now();
+        
+        // Query for expired keypackages
+        let expired_docs = self.db
+            .fluent()
+            .select()
+            .from("mls_keypackages")
+            .filter(|f| f.field("expires_at").less_than_or_equal(now))
+            .query()
+            .await?;
+
+        let mut deleted_count = 0u32;
+
+        // Group expired keypackages by owner
+        let mut expired_by_owner: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        
+        for doc in expired_docs {
+            if let Ok(kp) = firestore::FirestoreDb::deserialize_doc_to::<KeyPackageDoc>(&doc) {
+                expired_by_owner.entry(kp.owner_pubkey.clone())
+                    .or_insert_with(Vec::new)
+                    .push(kp.event_id);
+            }
+        }
+
+        // For each owner, delete expired keypackages but preserve at least one
+        for (owner_pubkey, expired_ids) in expired_by_owner {
+            // Count total valid keypackages for this user
+            let total_count = self.count_user_keypackages(&owner_pubkey).await?;
+            
+            // Calculate how many we can safely delete while keeping at least one
+            let deletable_count = if total_count > expired_ids.len() as u32 {
+                // User has non-expired keypackages, can delete all expired
+                expired_ids.len()
+            } else {
+                // All keypackages are expired, keep at least one
+                expired_ids.len().saturating_sub(1)
+            };
+            
+            // Delete the deletable expired keypackages
+            for (i, event_id) in expired_ids.iter().enumerate() {
+                if i < deletable_count {
+                    if let Ok(_) = self.db
+                        .fluent()
+                        .delete()
+                        .from("mls_keypackages")
+                        .document_id(event_id)
+                        .execute()
+                        .await
+                    {
+                        deleted_count += 1;
+                    }
+                } else {
+                    info!("Preserving expired keypackage {} as last remaining for user {}",
+                          event_id, owner_pubkey);
+                }
+            }
+        }
+
+        if deleted_count > 0 {
+            info!("Cleaned up {} expired keypackages", deleted_count);
+        }
+
+        Ok(deleted_count)
     }
 }
 

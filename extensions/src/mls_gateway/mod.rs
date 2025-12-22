@@ -107,6 +107,8 @@ pub struct MlsGatewayConfig {
     pub backfill_kinds: Vec<u32>,
     /// Upper bound on total events to backfill
     pub backfill_max_events: u32,
+    /// Maximum number of keypackages per user
+    pub max_keypackages_per_user: Option<u32>,
 }
 
 impl Default for MlsGatewayConfig {
@@ -132,6 +134,7 @@ impl Default for MlsGatewayConfig {
             backfill_on_startup: true,
             backfill_kinds: vec![445, 1059, 446],
             backfill_max_events: 50000,
+            max_keypackages_per_user: Some(10),
         }
     }
 }
@@ -173,6 +176,37 @@ pub trait MlsStorage: Send + Sync {
     /// KeyPackage Relays List per owner (kind 10051)
     async fn upsert_keypackage_relays(&self, owner_pubkey: &str, relays: &[String]) -> anyhow::Result<()>;
     async fn get_keypackage_relays(&self, owner_pubkey: &str) -> anyhow::Result<Vec<String>>;
+
+    /// KeyPackage lifecycle management (kind 443)
+    async fn store_keypackage(
+        &self,
+        event_id: &str,
+        owner_pubkey: &str,
+        content: &str,
+        ciphersuite: &str,
+        extensions: &[String],
+        relays: &[String],
+        has_last_resort: bool,
+        created_at: i64,
+        expires_at: i64,
+    ) -> anyhow::Result<()>;
+    
+    /// Query keypackages with filters
+    async fn query_keypackages(
+        &self,
+        authors: Option<&[String]>,
+        since: Option<i64>,
+        limit: Option<u32>,
+    ) -> anyhow::Result<Vec<(String, String, String, i64)>>; // (event_id, owner_pubkey, content, created_at)
+    
+    /// Delete a consumed keypackage (unless it's a last resort keypackage)
+    async fn delete_consumed_keypackage(&self, event_id: &str) -> anyhow::Result<bool>; // returns true if deleted
+    
+    /// Count keypackages per user
+    async fn count_user_keypackages(&self, owner_pubkey: &str) -> anyhow::Result<u32>;
+    
+    /// Clean up expired keypackages
+    async fn cleanup_expired_keypackages(&self) -> anyhow::Result<u32>;
 }
 
 /// MLS Gateway Extension
@@ -313,6 +347,71 @@ impl StorageBackend {
             StorageBackend::Firestore(storage) => storage.get_keypackage_relays(owner_pubkey).await,
         }
     }
+
+    async fn store_keypackage(
+        &self,
+        event_id: &str,
+        owner_pubkey: &str,
+        content: &str,
+        ciphersuite: &str,
+        extensions: &[String],
+        relays: &[String],
+        has_last_resort: bool,
+        created_at: i64,
+        expires_at: i64,
+    ) -> anyhow::Result<()> {
+        match self {
+            #[cfg(feature = "mls_gateway_sql")]
+            StorageBackend::Sql(storage) => storage.store_keypackage(
+                event_id, owner_pubkey, content, ciphersuite, extensions, relays, has_last_resort, created_at, expires_at
+            ).await,
+            #[cfg(feature = "mls_gateway_firestore")]
+            StorageBackend::Firestore(storage) => storage.store_keypackage(
+                event_id, owner_pubkey, content, ciphersuite, extensions, relays, has_last_resort, created_at, expires_at
+            ).await,
+        }
+    }
+
+    async fn query_keypackages(
+        &self,
+        authors: Option<&[String]>,
+        since: Option<i64>,
+        limit: Option<u32>,
+    ) -> anyhow::Result<Vec<(String, String, String, i64)>> {
+        match self {
+            #[cfg(feature = "mls_gateway_sql")]
+            StorageBackend::Sql(storage) => storage.query_keypackages(authors, since, limit).await,
+            #[cfg(feature = "mls_gateway_firestore")]
+            StorageBackend::Firestore(storage) => storage.query_keypackages(authors, since, limit).await,
+        }
+    }
+
+    async fn delete_consumed_keypackage(&self, event_id: &str) -> anyhow::Result<bool> {
+        match self {
+            #[cfg(feature = "mls_gateway_sql")]
+            StorageBackend::Sql(storage) => storage.delete_consumed_keypackage(event_id).await,
+            #[cfg(feature = "mls_gateway_firestore")]
+            StorageBackend::Firestore(storage) => storage.delete_consumed_keypackage(event_id).await,
+        }
+    }
+
+    async fn count_user_keypackages(&self, owner_pubkey: &str) -> anyhow::Result<u32> {
+        match self {
+            #[cfg(feature = "mls_gateway_sql")]
+            StorageBackend::Sql(storage) => storage.count_user_keypackages(owner_pubkey).await,
+            #[cfg(feature = "mls_gateway_firestore")]
+            StorageBackend::Firestore(storage) => storage.count_user_keypackages(owner_pubkey).await,
+        }
+    }
+
+    async fn cleanup_expired_keypackages(&self) -> anyhow::Result<u32> {
+        match self {
+            #[cfg(feature = "mls_gateway_sql")]
+            StorageBackend::Sql(storage) => storage.cleanup_expired_keypackages().await,
+            #[cfg(feature = "mls_gateway_firestore")]
+            StorageBackend::Firestore(storage) => storage.cleanup_expired_keypackages().await,
+        }
+    }
 }
 
 pub struct MlsGateway {
@@ -345,6 +444,8 @@ impl MlsGateway {
         describe_counter!("mls_gateway_events_processed", "Number of MLS events processed by kind");
         describe_counter!("mls_gateway_groups_updated", "Number of group registry updates");
         describe_counter!("mls_gateway_keypackages_stored", "Number of key packages stored");
+        describe_counter!("mls_gateway_keypackages_consumed", "Number of key packages consumed by requests");
+        describe_counter!("mls_gateway_keypackages_expired_cleanup", "Number of expired key packages cleaned up");
         describe_counter!("mls_gateway_welcomes_stored", "Number of welcome messages stored");
         describe_counter!("mls_gateway_giftwarps_processed", "Number of giftwrap envelopes processed");
         describe_counter!("mls_gateway_membership_updates", "Number of membership updates from giftwarps");
@@ -355,6 +456,7 @@ impl MlsGateway {
         describe_counter!("mls_gateway_445_unexpected_tag", "Count of unexpected outer tags observed on kind 445 events");
         describe_counter!("mls_gateway_top_level_444_dropped", "Number of top-level 444 events dropped (should be wrapped in 1059)");
         describe_counter!("mls_gateway_10051_processed", "Number of KeyPackage Relays List (10051) events processed");
+        describe_counter!("mls_gateway_keypackage_requests_processed", "Number of KeyPackage requests (447) processed");
         describe_histogram!("mls_gateway_db_operation_duration", "Duration of database operations");
 
         // Initialize storage backend
@@ -425,9 +527,29 @@ impl MlsGateway {
             None
         };
         
-        self.store = Some(store);
+        self.store = Some(store.clone());
         self.message_archive = message_archive;
         self.initialized = true;
+        
+        // Spawn background task for periodic keypackage cleanup
+        let cleanup_store = store;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600)); // Run every hour
+            loop {
+                interval.tick().await;
+                match cleanup_store.cleanup_expired_keypackages().await {
+                    Ok(count) => {
+                        if count > 0 {
+                            info!("Cleaned up {} expired keypackages", count);
+                            counter!("mls_gateway_keypackages_expired_cleanup").increment(count as u64);
+                        }
+                    }
+                    Err(e) => {
+                        error!("Error cleaning up expired keypackages: {}", e);
+                    }
+                }
+            }
+        });
         
         info!("MLS Gateway Extension initialized successfully");
         Ok(())
@@ -440,7 +562,7 @@ impl MlsGateway {
 
     /// Handle KeyPackage (kind 443)
     async fn handle_keypackage(&self, event: &Event) -> anyhow::Result<()> {
-        let _store = self.store()?;
+        let store = self.store()?;
         
         // Extract owner from p tag (should match pubkey for security)
         let owner_tag = event.tags().iter()
@@ -503,6 +625,10 @@ impl MlsGateway {
             counter!("mls_gateway_443_missing_tag").increment(1);
         }
 
+        // Note: We no longer check for "last_resort" extension as we use
+        // the "last remaining keypackage" approach instead
+        let has_last_resort = false; // Keep parameter for backward compatibility
+
         // Relays: accept either a single ["relays", ..many..] tag or multiple ["relay", url] tags
         let relays_vec = event.tags().iter()
             .find(|tag| !tag.is_empty() && tag[0] == "relays")
@@ -511,8 +637,13 @@ impl MlsGateway {
             .filter(|tag| tag.len() >= 2 && tag[0] == "relay")
             .map(|tag| tag[1].clone())
             .collect();
-        let relays_present = relays_vec.as_ref().map(|v| !v.is_empty()).unwrap_or(false) || !relay_tags.is_empty();
-        if !relays_present {
+        let all_relays = if let Some(rv) = relays_vec {
+            rv
+        } else {
+            relay_tags
+        };
+        
+        if all_relays.is_empty() {
             warn!("KeyPackage missing relays list (tag 'relays' or repeated 'relay')");
             counter!("mls_gateway_443_missing_tag").increment(1);
         }
@@ -523,9 +654,36 @@ impl MlsGateway {
         if !is_hex {
             warn!("KeyPackage content is not valid hex payload (soft validation)");
             counter!("mls_gateway_443_content_invalid").increment(1);
+            return Err(anyhow::anyhow!("Invalid keypackage content format"));
         }
+
+        // Check per-user limits (if configured)
+        let max_keypackages = self.config.max_keypackages_per_user.unwrap_or(10);
+        let current_count = store.count_user_keypackages(&event_pubkey).await?;
+        if current_count >= max_keypackages {
+            warn!("User {} has reached keypackage limit ({} >= {})", event_pubkey, current_count, max_keypackages);
+            return Err(anyhow::anyhow!("User keypackage limit exceeded"));
+        }
+
+        // Calculate expiry if not provided
+        let expires_at = expiry.unwrap_or_else(|| {
+            chrono::Utc::now().timestamp() + self.config.keypackage_ttl as i64
+        });
+
+        // Store the keypackage
+        store.store_keypackage(
+            &event.id_str(),
+            &event_pubkey,
+            content,
+            &ciphersuite.unwrap_or_default(),
+            &extensions.unwrap_or_default(),
+            &all_relays,
+            has_last_resort,
+            event.created_at() as i64,
+            expires_at,
+        ).await?;
         
-        info!("Processing KeyPackage from owner: {}", event_pubkey);
+        info!("Stored KeyPackage {} from owner: {} (last_resort: {})", event.id_str(), event_pubkey, has_last_resort);
         counter!("mls_gateway_keypackages_stored").increment(1);
         counter!("mls_gateway_events_processed", "kind" => "443").increment(1);
         Ok(())
@@ -552,6 +710,13 @@ impl MlsGateway {
             if let Some(ref gid) = group_id {
                 info!("Giftwrap hints group {} for {}", gid, recipient);
             }
+            
+            // NOTE: Welcome messages inside giftwraps contain an 'e' tag referencing the consumed keypackage,
+            // but since giftwraps are end-to-end encrypted, the relay cannot decrypt them to track consumption.
+            // Keypackage consumption tracking would require either:
+            // 1. Clients explicitly notifying the relay when a keypackage is consumed
+            // 2. The relay having access to decrypt Welcome messages (breaks E2EE)
+            // For now, we rely on TTL-based expiry and client cooperation.
         } else {
             // NIP-59 requires a 'p' tag for recipient routing; warn if missing
             warn!("Giftwrap missing required p (recipient) tag");
@@ -622,32 +787,22 @@ impl MlsGateway {
         let event_pubkey = hex::encode(event.pubkey());
 
         // Authorization:
-        // If scoped to a group (h tag present), require owner or group admin for that group.
-        // Otherwise, fall back to system/admin allowlist.
+        // For MLS to work, any authenticated user must be able to request keypackages
+        // to create groups and add members. This is a core user functionality, not admin-only.
+        
+        // Log the request for visibility
+        info!("KeyPackage request received from authenticated user: {}", event_pubkey);
+        
+        // If scoped to a group (h tag present), optionally verify membership
+        // But for now, allow any authenticated user to request keypackages
         let scoped_group = event.tags().iter()
             .find(|tag| tag.len() >= 2 && tag[0] == "h")
             .map(|tag| tag[1].clone());
-
-        if let Some(group_id) = scoped_group {
-            let store = self.store()?;
-            let is_owner = store.is_owner(&group_id, &event_pubkey).await.unwrap_or(false);
-            let is_admin = store.is_admin(&group_id, &event_pubkey).await.unwrap_or(false);
-            if !(is_owner || is_admin) {
-                warn!("Unauthorized KeyPackage request for group {} from {}", group_id, event_pubkey);
-                return Err(anyhow::anyhow!("Unauthorized KeyPackage request for group"));
-            }
-        } else {
-            // Verify sender is authorized (system key or admin)
-            let is_authorized = if let Some(ref system_key) = self.config.system_pubkey {
-                &event_pubkey == system_key || self.config.admin_pubkeys.contains(&event_pubkey)
-            } else {
-                self.config.admin_pubkeys.contains(&event_pubkey)
-            };
-
-            if !is_authorized {
-                warn!("Unauthorized KeyPackage request from pubkey: {}", event_pubkey);
-                return Err(anyhow::anyhow!("Unauthorized KeyPackage request"));
-            }
+            
+        if let Some(group_id) = &scoped_group {
+            info!("KeyPackage request scoped to group: {}", group_id);
+            // Note: We're allowing any authenticated user to request keypackages
+            // even for group-scoped requests, as they may need them to join the group
         }
 
         // Extract recipient from p tag
@@ -655,44 +810,74 @@ impl MlsGateway {
             .find(|tag| tag.len() >= 2 && tag[0] == "p")
             .map(|tag| tag[1].clone());
 
-        if recipient.is_none() {
+        if let Some(recipient_pubkey) = recipient {
+            // Extract optional parameters
+            let group_id = event.tags().iter()
+                .find(|tag| tag.len() >= 2 && tag[0] == "h")
+                .map(|tag| tag[1].clone());
+
+            let ciphersuite = event.tags().iter()
+                .find(|tag| tag.len() >= 2 && tag[0] == "cs")
+                .map(|tag| tag[1].clone());
+
+            let min_count = event.tags().iter()
+                .find(|tag| tag.len() >= 2 && tag[0] == "min")
+                .and_then(|tag| tag[1].parse::<u32>().ok())
+                .unwrap_or(1);
+
+            let ttl = event.tags().iter()
+                .find(|tag| tag.len() >= 2 && tag[0] == "ttl")
+                .and_then(|tag| tag[1].parse::<u64>().ok())
+                .unwrap_or(self.config.keypackage_request_ttl);
+
+            // Check if request has expired
+            let now = chrono::Utc::now().timestamp() as u64;
+            let created_at = event.created_at() as u64;
+            if created_at + ttl < now {
+                warn!("KeyPackage request has expired");
+                return Err(anyhow::anyhow!("KeyPackage request has expired"));
+            }
+
+            info!("Processing KeyPackage request: recipient={}, group={:?}, ciphersuite={:?}, min={}",
+                  recipient_pubkey, group_id, ciphersuite, min_count);
+
+            // Query available keypackages for the recipient
+            let store = self.store()?;
+            let keypackages = store.query_keypackages(
+                Some(&[recipient_pubkey.clone()]),
+                None, // No since filter
+                Some(min_count.max(10)) // Limit to reasonable number
+            ).await?;
+
+            info!("Found {} keypackages for recipient {}", keypackages.len(), recipient_pubkey);
+
+            // Mark keypackages as consumed (except the last remaining one)
+            // As per user suggestion: "we could consider a keypackage that has been delivered by request to a client as 'consumed'"
+            let mut consumed_count = 0;
+            for (event_id, _owner, _content, _created_at) in &keypackages {
+                // Try to delete (which preserves the last remaining keypackage internally)
+                if store.delete_consumed_keypackage(event_id).await? {
+                    consumed_count += 1;
+                }
+            }
+
+            if consumed_count > 0 {
+                info!("Marked {} keypackages as consumed for recipient {} (preserving last remaining)",
+                      consumed_count, recipient_pubkey);
+                counter!("mls_gateway_keypackages_consumed").increment(consumed_count);
+            }
+
+            // Note: The actual delivery of keypackages to the requester would happen through
+            // the normal Nostr REQ/EVENT flow. The requester can query for kind 443 events
+            // authored by the recipient after making this request.
+
+            counter!("mls_gateway_keypackage_requests_processed").increment(1);
+            counter!("mls_gateway_events_processed", "kind" => "447").increment(1);
+            Ok(())
+        } else {
             warn!("KeyPackage request missing recipient (p tag)");
-            return Err(anyhow::anyhow!("Missing recipient in KeyPackage request"));
+            Err(anyhow::anyhow!("Missing recipient in KeyPackage request"))
         }
-
-        // Extract optional parameters
-        let group_id = event.tags().iter()
-            .find(|tag| tag.len() >= 2 && tag[0] == "h")
-            .map(|tag| tag[1].clone());
-
-        let ciphersuite = event.tags().iter()
-            .find(|tag| tag.len() >= 2 && tag[0] == "cs")
-            .map(|tag| tag[1].clone());
-
-        let min_count = event.tags().iter()
-            .find(|tag| tag.len() >= 2 && tag[0] == "min")
-            .and_then(|tag| tag[1].parse::<u32>().ok())
-            .unwrap_or(1);
-
-        let ttl = event.tags().iter()
-            .find(|tag| tag.len() >= 2 && tag[0] == "ttl")
-            .and_then(|tag| tag[1].parse::<u64>().ok())
-            .unwrap_or(self.config.keypackage_request_ttl);
-
-        // Check if request has expired
-        let now = chrono::Utc::now().timestamp() as u64;
-        let created_at = event.created_at() as u64;
-        if created_at + ttl < now {
-            warn!("KeyPackage request has expired");
-            return Err(anyhow::anyhow!("KeyPackage request has expired"));
-        }
-
-        info!("Processing KeyPackage request: recipient={:?}, group={:?}, ciphersuite={:?}, min={}",
-              recipient, group_id, ciphersuite, min_count);
-
-        counter!("mls_gateway_keypackage_requests_processed").increment(1);
-        counter!("mls_gateway_events_processed", "kind" => "447").increment(1);
-        Ok(())
     }
 
     /// Handle KeyPackage Relays List (kind 10051)
