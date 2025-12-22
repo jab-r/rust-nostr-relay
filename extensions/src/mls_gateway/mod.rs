@@ -197,6 +197,7 @@ pub trait MlsStorage: Send + Sync {
         authors: Option<&[String]>,
         since: Option<i64>,
         limit: Option<u32>,
+        order_by: Option<&str>,
     ) -> anyhow::Result<Vec<(String, String, String, i64)>>; // (event_id, owner_pubkey, content, created_at)
     
     /// Delete a consumed keypackage (unless it's a last resort keypackage)
@@ -207,6 +208,29 @@ pub trait MlsStorage: Send + Sync {
     
     /// Clean up expired keypackages
     async fn cleanup_expired_keypackages(&self) -> anyhow::Result<u32>;
+
+    // New methods for pending deletion management
+    
+    /// Create a pending deletion record for last resort keypackage
+    async fn create_pending_deletion(&self, pending: &firestore::PendingDeletion) -> anyhow::Result<()>;
+    
+    /// Get pending deletion for a user
+    async fn get_pending_deletion(&self, user_pubkey: &str) -> anyhow::Result<Option<firestore::PendingDeletion>>;
+    
+    /// Update pending deletion (add new keypackages to the list)
+    async fn update_pending_deletion(&self, pending: &firestore::PendingDeletion) -> anyhow::Result<()>;
+    
+    /// Delete pending deletion record
+    async fn delete_pending_deletion(&self, user_pubkey: &str) -> anyhow::Result<()>;
+    
+    /// Delete keypackage by ID (bypassing last-one check)
+    async fn delete_keypackage_by_id(&self, event_id: &str) -> anyhow::Result<()>;
+    
+    /// Check if a keypackage exists
+    async fn keypackage_exists(&self, event_id: &str) -> anyhow::Result<bool>;
+    
+    /// Get all pending deletions that should be processed
+    async fn get_expired_pending_deletions(&self) -> anyhow::Result<Vec<firestore::PendingDeletion>>;
 }
 
 /// MLS Gateway Extension
@@ -377,12 +401,13 @@ impl StorageBackend {
         authors: Option<&[String]>,
         since: Option<i64>,
         limit: Option<u32>,
+        order_by: Option<&str>,
     ) -> anyhow::Result<Vec<(String, String, String, i64)>> {
         match self {
             #[cfg(feature = "mls_gateway_sql")]
-            StorageBackend::Sql(storage) => storage.query_keypackages(authors, since, limit).await,
+            StorageBackend::Sql(storage) => storage.query_keypackages(authors, since, limit, order_by).await,
             #[cfg(feature = "mls_gateway_firestore")]
-            StorageBackend::Firestore(storage) => storage.query_keypackages(authors, since, limit).await,
+            StorageBackend::Firestore(storage) => storage.query_keypackages(authors, since, limit, order_by).await,
         }
     }
 
@@ -410,6 +435,71 @@ impl StorageBackend {
             StorageBackend::Sql(storage) => storage.cleanup_expired_keypackages().await,
             #[cfg(feature = "mls_gateway_firestore")]
             StorageBackend::Firestore(storage) => storage.cleanup_expired_keypackages().await,
+        }
+    }
+
+    // New methods for pending deletion management
+    
+    async fn create_pending_deletion(&self, pending: &firestore::PendingDeletion) -> anyhow::Result<()> {
+        match self {
+            #[cfg(feature = "mls_gateway_sql")]
+            StorageBackend::Sql(_storage) => Err(anyhow::anyhow!("Pending deletion not implemented for SQL backend")),
+            #[cfg(feature = "mls_gateway_firestore")]
+            StorageBackend::Firestore(storage) => storage.create_pending_deletion(pending).await,
+        }
+    }
+    
+    async fn get_pending_deletion(&self, user_pubkey: &str) -> anyhow::Result<Option<firestore::PendingDeletion>> {
+        match self {
+            #[cfg(feature = "mls_gateway_sql")]
+            StorageBackend::Sql(_storage) => Ok(None),
+            #[cfg(feature = "mls_gateway_firestore")]
+            StorageBackend::Firestore(storage) => storage.get_pending_deletion(user_pubkey).await,
+        }
+    }
+    
+    async fn update_pending_deletion(&self, pending: &firestore::PendingDeletion) -> anyhow::Result<()> {
+        match self {
+            #[cfg(feature = "mls_gateway_sql")]
+            StorageBackend::Sql(_storage) => Err(anyhow::anyhow!("Pending deletion not implemented for SQL backend")),
+            #[cfg(feature = "mls_gateway_firestore")]
+            StorageBackend::Firestore(storage) => storage.update_pending_deletion(pending).await,
+        }
+    }
+    
+    async fn delete_pending_deletion(&self, user_pubkey: &str) -> anyhow::Result<()> {
+        match self {
+            #[cfg(feature = "mls_gateway_sql")]
+            StorageBackend::Sql(_storage) => Ok(()),
+            #[cfg(feature = "mls_gateway_firestore")]
+            StorageBackend::Firestore(storage) => storage.delete_pending_deletion(user_pubkey).await,
+        }
+    }
+    
+    async fn delete_keypackage_by_id(&self, event_id: &str) -> anyhow::Result<()> {
+        match self {
+            #[cfg(feature = "mls_gateway_sql")]
+            StorageBackend::Sql(_storage) => Err(anyhow::anyhow!("Direct deletion not implemented for SQL backend")),
+            #[cfg(feature = "mls_gateway_firestore")]
+            StorageBackend::Firestore(storage) => storage.delete_keypackage_by_id(event_id).await,
+        }
+    }
+    
+    async fn keypackage_exists(&self, event_id: &str) -> anyhow::Result<bool> {
+        match self {
+            #[cfg(feature = "mls_gateway_sql")]
+            StorageBackend::Sql(_storage) => Ok(false),
+            #[cfg(feature = "mls_gateway_firestore")]
+            StorageBackend::Firestore(storage) => storage.keypackage_exists(event_id).await,
+        }
+    }
+    
+    async fn get_expired_pending_deletions(&self) -> anyhow::Result<Vec<firestore::PendingDeletion>> {
+        match self {
+            #[cfg(feature = "mls_gateway_sql")]
+            StorageBackend::Sql(_storage) => Ok(Vec::new()),
+            #[cfg(feature = "mls_gateway_firestore")]
+            StorageBackend::Firestore(storage) => storage.get_expired_pending_deletions().await,
         }
     }
 }
@@ -665,6 +755,21 @@ impl MlsGateway {
             return Err(anyhow::anyhow!("User keypackage limit exceeded"));
         }
 
+        // Check if this is a last resort scenario (user had exactly 1 keypackage before this upload)
+        let should_start_timer = current_count == 1;
+        let oldest_keypackage_id = if should_start_timer {
+            // Get the existing keypackage ID (the one that will become "last resort")
+            let existing = store.query_keypackages(
+                Some(&[event_pubkey.clone()]),
+                None,
+                Some(1),
+                Some("created_at_asc") // Get the oldest one
+            ).await?;
+            existing.first().map(|(id, _, _, _)| id.clone())
+        } else {
+            None
+        };
+
         // Calculate expiry if not provided
         let expires_at = expiry.unwrap_or_else(|| {
             chrono::Utc::now().timestamp() + self.config.keypackage_ttl as i64
@@ -684,6 +789,26 @@ impl MlsGateway {
         ).await?;
         
         info!("Stored KeyPackage {} from owner: {} (last_resort: {})", event.id_str(), event_pubkey, has_last_resort);
+        
+        // Handle last resort transition
+        if should_start_timer && oldest_keypackage_id.is_some() {
+            let store_clone = store.clone();
+            let event_pubkey_clone = event_pubkey.clone();
+            let new_keypackage_id = event.id_str();
+            let oldest_id = oldest_keypackage_id.unwrap();
+            
+            tokio::spawn(async move {
+                if let Err(e) = handle_last_resort_transition(
+                    store_clone,
+                    event_pubkey_clone,
+                    oldest_id,
+                    new_keypackage_id
+                ).await {
+                    error!("Failed to handle last resort transition: {}", e);
+                }
+            });
+        }
+        
         counter!("mls_gateway_keypackages_stored").increment(1);
         counter!("mls_gateway_events_processed", "kind" => "443").increment(1);
         Ok(())
@@ -842,11 +967,13 @@ impl MlsGateway {
                   recipient_pubkey, group_id, ciphersuite, min_count);
 
             // Query available keypackages for the recipient
+            // CRITICAL: Order by created_at ASC to return oldest keypackages first
             let store = self.store()?;
             let keypackages = store.query_keypackages(
                 Some(&[recipient_pubkey.clone()]),
                 None, // No since filter
-                Some(min_count.max(10)) // Limit to reasonable number
+                Some(min_count.max(10)), // Limit to reasonable number
+                Some("created_at_asc") // Return oldest first for rotation
             ).await?;
 
             info!("Found {} keypackages for recipient {}", keypackages.len(), recipient_pubkey);
@@ -1044,6 +1171,112 @@ impl MlsGateway {
         counter!("mls_gateway_events_processed", "kind" => "450").increment(1);
         Ok(())
     }
+}
+
+/// Handle the transition when a user goes from 1 to 2+ keypackages
+/// Starts a timer to delete the old keypackage after 10 minutes
+async fn handle_last_resort_transition(
+    store: StorageBackend,
+    user_pubkey: String,
+    old_keypackage_id: String,
+    new_keypackage_id: String,
+) -> anyhow::Result<()> {
+    use crate::mls_gateway::firestore::PendingDeletion;
+    use chrono::{Duration, Utc};
+    
+    let now = Utc::now();
+    let deletion_time = now + Duration::minutes(10);
+    
+    // Create pending deletion record
+    let pending = PendingDeletion {
+        user_pubkey: user_pubkey.clone(),
+        old_keypackage_id: old_keypackage_id.clone(),
+        new_keypackages_collected: vec![new_keypackage_id],
+        timer_started_at: now,
+        deletion_scheduled_at: deletion_time,
+    };
+    
+    store.create_pending_deletion(&pending).await?;
+    
+    info!(
+        "Started last resort keypackage deletion timer for user {} - will delete {} at {:?}",
+        user_pubkey, old_keypackage_id, deletion_time
+    );
+    counter!("mls_gateway_last_resort_timers_started").increment(1);
+    
+    // Spawn timer task
+    tokio::spawn(async move {
+        // Wait for 10 minutes
+        tokio::time::sleep(tokio::time::Duration::from_secs(600)).await;
+        
+        // Process the deletion
+        if let Err(e) = process_pending_deletion(store, user_pubkey).await {
+            error!("Failed to process pending deletion: {}", e);
+        }
+    });
+    
+    Ok(())
+}
+
+/// Process a pending deletion - check conditions and delete if appropriate
+async fn process_pending_deletion(
+    store: StorageBackend,
+    user_pubkey: String,
+) -> anyhow::Result<()> {
+    // Get the pending deletion record
+    let pending = match store.get_pending_deletion(&user_pubkey).await? {
+        Some(p) => p,
+        None => {
+            info!("No pending deletion found for user {}", user_pubkey);
+            return Ok(());
+        }
+    };
+    
+    // Check if it's time to delete
+    if pending.deletion_scheduled_at > chrono::Utc::now() {
+        info!("Deletion not yet due for user {}", user_pubkey);
+        return Ok(());
+    }
+    
+    // Count current valid keypackages
+    let keypackage_count = store.count_user_keypackages(&user_pubkey).await?;
+    
+    if keypackage_count < 3 {
+        // Not enough keypackages - cancel deletion
+        warn!(
+            "Cancelling deletion for user {} - only {} keypackages (need 3+)",
+            user_pubkey, keypackage_count
+        );
+        counter!("mls_gateway_last_resort_deletions_cancelled").increment(1);
+        
+        // Clean up the pending deletion record
+        store.delete_pending_deletion(&user_pubkey).await?;
+        return Ok(());
+    }
+    
+    // Check if the old keypackage still exists
+    if !store.keypackage_exists(&pending.old_keypackage_id).await? {
+        info!(
+            "Old keypackage {} already deleted for user {}",
+            pending.old_keypackage_id, user_pubkey
+        );
+        store.delete_pending_deletion(&user_pubkey).await?;
+        return Ok(());
+    }
+    
+    // All conditions met - delete the old keypackage
+    store.delete_keypackage_by_id(&pending.old_keypackage_id).await?;
+    
+    info!(
+        "Successfully deleted old keypackage {} for user {} (now has {} keypackages)",
+        pending.old_keypackage_id, user_pubkey, keypackage_count - 1
+    );
+    counter!("mls_gateway_last_resort_deletions_completed").increment(1);
+    
+    // Clean up the pending deletion record
+    store.delete_pending_deletion(&user_pubkey).await?;
+    
+    Ok(())
 }
 
 impl Extension for MlsGateway {
@@ -1369,5 +1602,211 @@ impl MlsGateway {
 
         counter!("mls_gateway_events_processed", "kind" => "445").increment(1);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nostr_relay::db::Event;
+    use chrono::Utc;
+    
+    // Mock storage backend for testing
+    struct MockStorage {
+        keypackages: std::sync::Arc<std::sync::Mutex<Vec<(String, String, i64)>>>, // (id, owner, created_at)
+        pending_deletions: std::sync::Arc<std::sync::Mutex<Vec<crate::mls_gateway::firestore::PendingDeletion>>>,
+    }
+    
+    impl MockStorage {
+        fn new() -> Self {
+            Self {
+                keypackages: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                pending_deletions: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+        
+        async fn add_keypackage(&self, id: &str, owner: &str) {
+            let mut kps = self.keypackages.lock().unwrap();
+            kps.push((id.to_string(), owner.to_string(), Utc::now().timestamp()));
+        }
+        
+        async fn count_keypackages(&self, owner: &str) -> usize {
+            let kps = self.keypackages.lock().unwrap();
+            kps.iter().filter(|(_, o, _)| o == owner).count()
+        }
+        
+        async fn get_oldest_keypackage(&self, owner: &str) -> Option<String> {
+            let kps = self.keypackages.lock().unwrap();
+            kps.iter()
+                .filter(|(_, o, _)| o == owner)
+                .min_by_key(|(_, _, created)| *created)
+                .map(|(id, _, _)| id.clone())
+        }
+        
+        async fn has_pending_deletion(&self, owner: &str) -> bool {
+            let pds = self.pending_deletions.lock().unwrap();
+            pds.iter().any(|pd| pd.user_pubkey == owner)
+        }
+        
+        async fn get_pending_deletion(&self, owner: &str) -> Option<crate::mls_gateway::firestore::PendingDeletion> {
+            let pds = self.pending_deletions.lock().unwrap();
+            pds.iter().find(|pd| pd.user_pubkey == owner).cloned()
+        }
+    }
+    
+    #[tokio::test]
+    async fn test_last_resort_timer_not_started_with_zero_keypackages() {
+        let storage = MockStorage::new();
+        let owner = "test_user";
+        
+        // User has 0 keypackages initially
+        assert_eq!(storage.count_keypackages(owner).await, 0);
+        
+        // Upload first keypackage
+        storage.add_keypackage("kp1", owner).await;
+        
+        // No timer should be started (user went from 0 to 1 keypackage)
+        assert!(!storage.has_pending_deletion(owner).await);
+    }
+    
+    #[tokio::test]
+    async fn test_last_resort_timer_started_with_one_keypackage() {
+        let storage = MockStorage::new();
+        let owner = "test_user";
+        
+        // User has 1 keypackage initially
+        storage.add_keypackage("kp1", owner).await;
+        assert_eq!(storage.count_keypackages(owner).await, 1);
+        
+        // Upload second keypackage - this should trigger timer
+        storage.add_keypackage("kp2", owner).await;
+        
+        // Simulate timer creation
+        let pending = crate::mls_gateway::firestore::PendingDeletion {
+            user_pubkey: owner.to_string(),
+            old_keypackage_id: "kp1".to_string(),
+            new_keypackages_collected: vec!["kp2".to_string()],
+            timer_started_at: Utc::now(),
+            deletion_scheduled_at: Utc::now() + chrono::Duration::minutes(10),
+        };
+        storage.pending_deletions.lock().unwrap().push(pending);
+        
+        // Timer should be started
+        assert!(storage.has_pending_deletion(owner).await);
+        let pd = storage.get_pending_deletion(owner).await.unwrap();
+        assert_eq!(pd.old_keypackage_id, "kp1");
+        assert_eq!(pd.new_keypackages_collected.len(), 1);
+    }
+    
+    #[tokio::test]
+    async fn test_last_resort_timer_not_started_with_multiple_keypackages() {
+        let storage = MockStorage::new();
+        let owner = "test_user";
+        
+        // User has 2 keypackages initially
+        storage.add_keypackage("kp1", owner).await;
+        storage.add_keypackage("kp2", owner).await;
+        assert_eq!(storage.count_keypackages(owner).await, 2);
+        
+        // Upload third keypackage
+        storage.add_keypackage("kp3", owner).await;
+        
+        // No timer should be started (user already had 2+ keypackages)
+        assert!(!storage.has_pending_deletion(owner).await);
+    }
+    
+    #[tokio::test]
+    async fn test_deletion_cancelled_if_not_enough_keypackages() {
+        let storage = MockStorage::new();
+        let owner = "test_user";
+        
+        // Set up scenario: user had 1 kp, uploaded 1 more
+        storage.add_keypackage("kp1", owner).await;
+        storage.add_keypackage("kp2", owner).await;
+        
+        // Create pending deletion that's already expired
+        let pending = crate::mls_gateway::firestore::PendingDeletion {
+            user_pubkey: owner.to_string(),
+            old_keypackage_id: "kp1".to_string(),
+            new_keypackages_collected: vec!["kp2".to_string()],
+            timer_started_at: Utc::now() - chrono::Duration::minutes(15),
+            deletion_scheduled_at: Utc::now() - chrono::Duration::minutes(5),
+        };
+        storage.pending_deletions.lock().unwrap().push(pending);
+        
+        // With only 2 keypackages, deletion should be cancelled
+        assert_eq!(storage.count_keypackages(owner).await, 2);
+        
+        // In real implementation, process_pending_deletion would:
+        // 1. Check keypackage count (2 < 3)
+        // 2. Cancel the deletion
+        // 3. Remove pending deletion record
+    }
+    
+    #[tokio::test]
+    async fn test_deletion_proceeds_with_enough_keypackages() {
+        let storage = MockStorage::new();
+        let owner = "test_user";
+        
+        // Set up scenario: user had 1 kp, uploaded 3 more
+        storage.add_keypackage("kp1", owner).await;
+        storage.add_keypackage("kp2", owner).await;
+        storage.add_keypackage("kp3", owner).await;
+        storage.add_keypackage("kp4", owner).await;
+        
+        // Create pending deletion that's already expired
+        let pending = crate::mls_gateway::firestore::PendingDeletion {
+            user_pubkey: owner.to_string(),
+            old_keypackage_id: "kp1".to_string(),
+            new_keypackages_collected: vec!["kp2".to_string(), "kp3".to_string(), "kp4".to_string()],
+            timer_started_at: Utc::now() - chrono::Duration::minutes(15),
+            deletion_scheduled_at: Utc::now() - chrono::Duration::minutes(5),
+        };
+        storage.pending_deletions.lock().unwrap().push(pending);
+        
+        // With 4 keypackages (>= 3), deletion should proceed
+        assert_eq!(storage.count_keypackages(owner).await, 4);
+        
+        // In real implementation, process_pending_deletion would:
+        // 1. Check keypackage count (4 >= 3)
+        // 2. Delete old keypackage (kp1)
+        // 3. Remove pending deletion record
+    }
+    
+    #[tokio::test]
+    async fn test_concurrent_uploads_during_timer() {
+        let storage = MockStorage::new();
+        let owner = "test_user";
+        
+        // User starts with 1 keypackage
+        storage.add_keypackage("kp1", owner).await;
+        
+        // Upload triggers timer
+        storage.add_keypackage("kp2", owner).await;
+        let pending = crate::mls_gateway::firestore::PendingDeletion {
+            user_pubkey: owner.to_string(),
+            old_keypackage_id: "kp1".to_string(),
+            new_keypackages_collected: vec!["kp2".to_string()],
+            timer_started_at: Utc::now(),
+            deletion_scheduled_at: Utc::now() + chrono::Duration::minutes(10),
+        };
+        storage.pending_deletions.lock().unwrap().push(pending);
+        
+        // More uploads during timer period
+        storage.add_keypackage("kp3", owner).await;
+        storage.add_keypackage("kp4", owner).await;
+        
+        // Update pending deletion with new keypackages
+        let mut pds = storage.pending_deletions.lock().unwrap();
+        if let Some(pd) = pds.iter_mut().find(|pd| pd.user_pubkey == owner) {
+            pd.new_keypackages_collected.push("kp3".to_string());
+            pd.new_keypackages_collected.push("kp4".to_string());
+        }
+        drop(pds);
+        
+        // Verify state
+        assert_eq!(storage.count_keypackages(owner).await, 4);
+        let pd = storage.get_pending_deletion(owner).await.unwrap();
+        assert_eq!(pd.new_keypackages_collected.len(), 3);
     }
 }

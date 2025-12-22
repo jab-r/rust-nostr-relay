@@ -1,14 +1,16 @@
 //! Cleanup command for expired keypackages
-//! 
+//!
 //! This module provides a cleanup command that can be run as a Cloud Run Job
 //! to remove expired keypackages from Firestore.
 
 use anyhow::Result;
 use tracing::{info, error};
-use extensions::mls_gateway::firestore::FirestoreStorage;
 
 /// Run cleanup of expired keypackages
+#[cfg(feature = "mls_gateway_firestore")]
 pub async fn run_cleanup() -> Result<()> {
+    use nostr_extensions::mls_gateway::firestore::FirestoreStorage;
+    
     info!("Starting keypackage cleanup job");
     
     // Get project ID from environment
@@ -39,4 +41,10 @@ pub async fn run_cleanup() -> Result<()> {
             Err(e)
         }
     }
+}
+
+#[cfg(not(feature = "mls_gateway_firestore"))]
+pub async fn run_cleanup() -> Result<()> {
+    error!("Cleanup command requires mls_gateway_firestore feature");
+    Err(anyhow::anyhow!("Cleanup command requires mls_gateway_firestore feature to be enabled"))
 }

@@ -301,13 +301,31 @@ impl Handler<Dispatch> for Subscriber {
         let event = &msg.event;
         let index = event.index();
         let event_str = event.to_string();
-        self.index.lookup(index, |session_id, sub_id| {
-            self.addr.do_send(SubscribeResult {
-                id: *session_id,
-                msg: OutgoingMessage::event(sub_id, &event_str),
-                sub_id: sub_id.clone(),
+        
+        // Log when sending keypackage events (kind 443) to clients
+        if event.kind() == 443 {
+            let event_id = event.id_str();
+            let author = hex::encode(event.pubkey());
+            self.index.lookup(index, |session_id, sub_id| {
+                tracing::info!(
+                    "Sending keypackage event (kind:443) {} from author {} to session {} subscription {}",
+                    event_id, author, session_id, sub_id
+                );
+                self.addr.do_send(SubscribeResult {
+                    id: *session_id,
+                    msg: OutgoingMessage::event(sub_id, &event_str),
+                    sub_id: sub_id.clone(),
+                });
             });
-        });
+        } else {
+            self.index.lookup(index, |session_id, sub_id| {
+                self.addr.do_send(SubscribeResult {
+                    id: *session_id,
+                    msg: OutgoingMessage::event(sub_id, &event_str),
+                    sub_id: sub_id.clone(),
+                });
+            });
+        }
     }
 }
 

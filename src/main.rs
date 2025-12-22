@@ -58,13 +58,24 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Cleanup => {
-            // Initialize tracing for logging
-            tracing_subscriber::fmt::init();
+            #[cfg(feature = "mls_gateway_firestore")]
+            {
+                // Initialize tracing for logging
+                tracing_subscriber::fmt::init();
+                
+                // Run cleanup in async context using actix-rt
+                let system = actix_rt::System::new();
+                system.block_on(async {
+                    rnostr::cleanup::run_cleanup().await
+                })?;
+            }
             
-            // Run cleanup in async context
-            tokio::runtime::Runtime::new()?.block_on(async {
-                rnostr::cleanup::run_cleanup().await
-            })?;
+            #[cfg(not(feature = "mls_gateway_firestore"))]
+            {
+                eprintln!("Error: Cleanup command requires mls_gateway_firestore feature to be enabled");
+                eprintln!("Build with: cargo build --features mls_gateway_firestore");
+                std::process::exit(1);
+            }
         }
     }
     Ok(())

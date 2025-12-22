@@ -65,6 +65,28 @@ struct KeyPackageDoc {
     pub expires_at: DateTime<Utc>,
 }
 
+/// Pending deletion for last resort keypackage mitigation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingDeletion {
+    pub user_pubkey: String,
+    pub old_keypackage_id: String,
+    pub new_keypackages_collected: Vec<String>,
+    #[serde(with = "chrono::serde::ts_seconds")]
+    pub timer_started_at: DateTime<Utc>,
+    #[serde(with = "chrono::serde::ts_seconds")]
+    pub deletion_scheduled_at: DateTime<Utc>,
+}
+
+/// Rate limit tracking for keypackage requests
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyPackageRequestRateLimit {
+    pub requester_pubkey: String,
+    pub recipient_pubkey: String,
+    pub request_count: u32,
+    #[serde(with = "chrono::serde::ts_seconds")]
+    pub window_start: DateTime<Utc>,
+}
+
 /// Firestore storage implementation
 #[derive(Debug)]
 pub struct FirestoreStorage {
@@ -215,6 +237,118 @@ impl FirestoreStorage {
         
         info!("Cleanup complete: deleted {} expired keypackages", deleted);
         Ok(deleted)
+    }
+
+    /// Create a pending deletion record for last resort keypackage
+    pub async fn create_pending_deletion(&self, pending: &PendingDeletion) -> Result<()> {
+        self.db
+            .fluent()
+            .insert()
+            .into("mls_pending_deletions")
+            .document_id(&pending.user_pubkey)
+            .object(pending)
+            .execute::<()>()
+            .await?;
+        
+        info!("Created pending deletion for user {} to delete keypackage {} at {:?}",
+              pending.user_pubkey, pending.old_keypackage_id, pending.deletion_scheduled_at);
+        Ok(())
+    }
+
+    /// Get pending deletion for a user
+    pub async fn get_pending_deletion(&self, user_pubkey: &str) -> Result<Option<PendingDeletion>> {
+        let docs = self.db
+            .fluent()
+            .select()
+            .from("mls_pending_deletions")
+            .filter(|f| f.field(firestore::path!(PendingDeletion::user_pubkey)).eq(user_pubkey))
+            .limit(1)
+            .query()
+            .await?;
+
+        if let Some(doc) = docs.into_iter().next() {
+            let pending = firestore::FirestoreDb::deserialize_doc_to::<PendingDeletion>(&doc)?;
+            Ok(Some(pending))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Update pending deletion (add new keypackages to the list)
+    pub async fn update_pending_deletion(&self, pending: &PendingDeletion) -> Result<()> {
+        self.db
+            .fluent()
+            .update()
+            .in_col("mls_pending_deletions")
+            .document_id(&pending.user_pubkey)
+            .object(pending)
+            .execute::<()>()
+            .await?;
+        
+        Ok(())
+    }
+
+    /// Delete pending deletion record
+    pub async fn delete_pending_deletion(&self, user_pubkey: &str) -> Result<()> {
+        self.db
+            .fluent()
+            .delete()
+            .from("mls_pending_deletions")
+            .document_id(user_pubkey)
+            .execute()
+            .await?;
+        
+        info!("Deleted pending deletion record for user {}", user_pubkey);
+        Ok(())
+    }
+
+    /// Delete keypackage by ID (bypassing last-one check)
+    pub async fn delete_keypackage_by_id(&self, event_id: &str) -> Result<()> {
+        self.db
+            .fluent()
+            .delete()
+            .from("mls_keypackages")
+            .document_id(event_id)
+            .execute()
+            .await?;
+        
+        info!("Deleted keypackage {}", event_id);
+        Ok(())
+    }
+
+    /// Check if a keypackage exists
+    pub async fn keypackage_exists(&self, event_id: &str) -> Result<bool> {
+        let docs = self.db
+            .fluent()
+            .select()
+            .from("mls_keypackages")
+            .filter(|f| f.field("event_id").eq(event_id))
+            .limit(1)
+            .query()
+            .await?;
+        
+        Ok(!docs.is_empty())
+    }
+
+    /// Get all pending deletions that should be processed
+    pub async fn get_expired_pending_deletions(&self) -> Result<Vec<PendingDeletion>> {
+        let now = Utc::now();
+        let docs = self.db
+            .fluent()
+            .select()
+            .from("mls_pending_deletions")
+            .filter(|f| f.field("deletion_scheduled_at").less_than_or_equal(now.timestamp()))
+            .query()
+            .await?;
+
+        let mut expired = Vec::new();
+        for doc in docs {
+            if let Ok(pending) = firestore::FirestoreDb::deserialize_doc_to::<PendingDeletion>(&doc) {
+                expired.push(pending);
+            }
+        }
+        
+        Ok(expired)
     }
 }
 
@@ -454,6 +588,7 @@ impl MlsStorage for FirestoreStorage {
         authors: Option<&[String]>,
         _since: Option<i64>, // Ignored - not needed for keypackage queries
         limit: Option<u32>,
+        order_by: Option<&str>,
     ) -> anyhow::Result<Vec<(String, String, String, i64)>> {
         let mut query = self.db
             .fluent()
@@ -467,11 +602,31 @@ impl MlsStorage for FirestoreStorage {
             }
         }
 
+        // Apply ordering if specified
+        if let Some(order) = order_by {
+            use firestore::*;
+            let order_clause = match order {
+                "created_at_asc" => vec![
+                    FirestoreQueryOrder::new("created_at".to_string(), FirestoreQueryDirection::Ascending)
+                ],
+                "created_at_desc" => vec![
+                    FirestoreQueryOrder::new("created_at".to_string(), FirestoreQueryDirection::Descending)
+                ],
+                _ => {
+                    // Default to ascending if unrecognized
+                    vec![
+                        FirestoreQueryOrder::new("created_at".to_string(), FirestoreQueryDirection::Ascending)
+                    ]
+                }
+            };
+            query = query.order_by(order_clause);
+        }
+
         // Apply limit
         let limit_val = limit.unwrap_or(100).min(1000) as u32;
         query = query.limit(limit_val);
 
-        // Simple query - no ordering, no expiration filtering
+        // Simple query - no expiration filtering
         // Expired keypackages are cleaned up by a separate daily job
         let docs = query.query().await?;
         let keypackages: Vec<(String, String, String, i64)> = docs
@@ -603,6 +758,36 @@ impl MlsStorage for FirestoreStorage {
         }
 
         Ok(deleted_count)
+    }
+    
+    // New methods for pending deletion management
+    
+    async fn create_pending_deletion(&self, pending: &crate::mls_gateway::firestore::PendingDeletion) -> anyhow::Result<()> {
+        self.create_pending_deletion(pending).await
+    }
+    
+    async fn get_pending_deletion(&self, user_pubkey: &str) -> anyhow::Result<Option<crate::mls_gateway::firestore::PendingDeletion>> {
+        self.get_pending_deletion(user_pubkey).await
+    }
+    
+    async fn update_pending_deletion(&self, pending: &crate::mls_gateway::firestore::PendingDeletion) -> anyhow::Result<()> {
+        self.update_pending_deletion(pending).await
+    }
+    
+    async fn delete_pending_deletion(&self, user_pubkey: &str) -> anyhow::Result<()> {
+        self.delete_pending_deletion(user_pubkey).await
+    }
+    
+    async fn delete_keypackage_by_id(&self, event_id: &str) -> anyhow::Result<()> {
+        self.delete_keypackage_by_id(event_id).await
+    }
+    
+    async fn keypackage_exists(&self, event_id: &str) -> anyhow::Result<bool> {
+        self.keypackage_exists(event_id).await
+    }
+    
+    async fn get_expired_pending_deletions(&self) -> anyhow::Result<Vec<crate::mls_gateway::firestore::PendingDeletion>> {
+        self.get_expired_pending_deletions().await
     }
 }
 

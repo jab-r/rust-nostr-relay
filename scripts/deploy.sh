@@ -212,11 +212,11 @@ gcloud run jobs create ${JOB_NAME} \
 # Get the job URI for the scheduler
 JOB_URI="https://${REGION}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${NAMESPACE}/jobs/${JOB_NAME}:run"
 
-# Create or update the Cloud Scheduler job
+# Create or update the Cloud Scheduler job (runs weekly on Sunday at 2 AM ET)
 echo "Setting up Cloud Scheduler: ${SCHEDULE_NAME}"
 gcloud scheduler jobs update http ${SCHEDULE_NAME} \
   --location ${REGION} \
-  --schedule "0 2 * * *" \
+  --schedule "0 2 * * 0" \
   --time-zone "America/New_York" \
   --uri "${JOB_URI}" \
   --http-method POST \
@@ -224,7 +224,7 @@ gcloud scheduler jobs update http ${SCHEDULE_NAME} \
   2>/dev/null || \
 gcloud scheduler jobs create http ${SCHEDULE_NAME} \
   --location ${REGION} \
-  --schedule "0 2 * * *" \
+  --schedule "0 2 * * 0" \
   --time-zone "America/New_York" \
   --uri "${JOB_URI}" \
   --http-method POST \
