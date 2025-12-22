@@ -5,6 +5,7 @@ use actix_web::web;
 use actix_web_actors::ws;
 use bytes::BytesMut;
 use metrics::{counter, gauge};
+use nostr_db::Event;
 use std::{
     any::{Any, TypeId},
     collections::HashMap,
@@ -12,6 +13,12 @@ use std::{
 };
 use tracing::{debug, info, error};
 use ws::Message;
+
+#[derive(Clone)]
+struct SubscriptionState {
+    subscription: Subscription,
+    extension_events: Vec<Event>,
+}
 
 pub struct Session {
     ip: String,
@@ -41,6 +48,9 @@ pub struct Session {
 
     /// Buffer for constructing continuation messages
     cont: Option<BytesMut>,
+
+    /// Active subscriptions with extension data
+    subscriptions: HashMap<String, SubscriptionState>,
 }
 
 impl Session {
@@ -81,6 +91,7 @@ impl Session {
             app,
             data: HashMap::default(),
             cont: None,
+            subscriptions: HashMap::new(),
         }
     }
 
@@ -147,11 +158,44 @@ impl Session {
                     .read()
                     .call_message(msg, self, ctx)
                 {
-                    crate::ExtensionMessageResult::Continue(msg) => {
+                    crate::ExtensionMessageResult::Continue(mut msg) => {
                         if let Err(err) = msg.validate_nip70() {
                             self.send_error(err, &msg, ctx);
                             return;
                         }
+                        
+                        // Process REQ messages through extensions
+                        if let crate::message::IncomingMessage::Req(ref subscription) = &msg.msg {
+                            let (req_result, extension_events) = self.app.extensions.read()
+                                .call_process_req(msg.id, subscription);
+                            
+                            match req_result {
+                                crate::extension::ExtensionReqResult::Handle(events) => {
+                                    // Extension fully handled the request
+                                    for event in events {
+                                        let event_json = serde_json::to_string(&event).unwrap_or_default();
+                                        ctx.text(crate::message::OutgoingMessage::event(&subscription.id, &event_json));
+                                    }
+                                    ctx.text(crate::message::OutgoingMessage::eose(&subscription.id));
+                                    return;
+                                }
+                                crate::extension::ExtensionReqResult::AddEvents(events) => {
+                                    // Store subscription state with extension events
+                                    self.subscriptions.insert(subscription.id.clone(), SubscriptionState {
+                                        subscription: subscription.clone(),
+                                        extension_events: events.clone(),
+                                    });
+                                }
+                                _ => {
+                                    // Normal processing, no extension events
+                                    self.subscriptions.insert(subscription.id.clone(), SubscriptionState {
+                                        subscription: subscription.clone(),
+                                        extension_events: vec![],
+                                    });
+                                }
+                            }
+                        }
+                        
                         self.server.do_send(msg);
                     }
                     crate::ExtensionMessageResult::Stop(out) => {
@@ -174,8 +218,49 @@ impl Handler<OutgoingMessage> for Session {
     type Result = ();
 
     fn handle(&mut self, msg: OutgoingMessage, ctx: &mut Self::Context) {
+        // Check if this is an EVENT message for a subscription we're tracking
+        if let Some(sub_id) = extract_event_subscription_id(&msg.0) {
+            if let Some(state) = self.subscriptions.get(&sub_id) {
+                // This is an event for a tracked subscription
+                // First, send any extension events that haven't been sent yet
+                if !state.extension_events.is_empty() {
+                    let mut state = self.subscriptions.remove(&sub_id).unwrap();
+                    for event in state.extension_events.drain(..) {
+                        let event_json = serde_json::to_string(&event).unwrap_or_default();
+                        ctx.text(OutgoingMessage::event(&sub_id, &event_json));
+                    }
+                    // Put it back without extension events
+                    self.subscriptions.insert(sub_id.clone(), state);
+                }
+            }
+        } else if let Some(sub_id) = extract_eose_subscription_id(&msg.0) {
+            // This is an EOSE, remove the subscription tracking
+            self.subscriptions.remove(&sub_id);
+        }
+        
         ctx.text(msg);
     }
+}
+
+// Helper functions to parse subscription IDs from messages
+fn extract_event_subscription_id(msg: &str) -> Option<String> {
+    if msg.starts_with(r#"["EVENT","#) {
+        let parts: Vec<&str> = msg.split('"').collect();
+        if parts.len() >= 4 {
+            return Some(parts[3].to_string());
+        }
+    }
+    None
+}
+
+fn extract_eose_subscription_id(msg: &str) -> Option<String> {
+    if msg.starts_with(r#"["EOSE","#) {
+        let parts: Vec<&str> = msg.split('"').collect();
+        if parts.len() >= 4 {
+            return Some(parts[3].to_string());
+        }
+    }
+    None
 }
 
 impl Actor for Session {

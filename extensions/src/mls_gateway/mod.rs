@@ -18,6 +18,9 @@ pub mod req_interceptor;
 pub mod keypackage_consumer;
 pub mod test_keypackage_flow;
 
+#[cfg(test)]
+pub mod test_req_interception;
+
 #[cfg(feature = "mls_gateway_firestore")]
 pub mod firestore;
 
@@ -33,14 +36,14 @@ pub use storage::SqlStorage;
 pub use message_archive::MessageArchive;
 
 use actix_web::web::ServiceConfig;
-use nostr_relay::{Extension, Session, ExtensionMessageResult};
+use nostr_relay::{Extension, Session, ExtensionMessageResult, ExtensionReqResult, PostProcessResult};
 use nostr_relay::db::Event;
-use nostr_relay::message::{ClientMessage, IncomingMessage, Subscription};
+use nostr_relay::message::Subscription;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{info, warn, error};
 use metrics::{counter, describe_counter, describe_histogram};
-use crate::mls_gateway::keypackage_delivery::{init_delivery_store, get_delivery_store};
+use crate::mls_gateway::keypackage_delivery::init_delivery_store;
 
 // MLS and Noise event kinds as per specification
 const KEYPACKAGE_KIND: u16 = 443;         // MLS KeyPackage
@@ -1395,6 +1398,139 @@ impl Extension for MlsGateway {
         }
 
         ExtensionMessageResult::Continue(msg)
+    }
+
+    fn process_req(
+        &self,
+        session_id: usize,
+        subscription: &Subscription,
+    ) -> ExtensionReqResult {
+        // Check if this is a query for KeyPackages (kind 443)
+        let is_keypackage_query = subscription.filters.iter().any(|filter| {
+            filter.kinds.iter().any(|&k| k == 443)
+        });
+
+        if !is_keypackage_query {
+            return ExtensionReqResult::Continue;
+        }
+
+        // Extract authors from filters to determine which KeyPackages to query
+        let mut authors: Vec<String> = Vec::new();
+        for filter in &subscription.filters {
+            for author in filter.authors.iter() {
+                authors.push(hex::encode(author));
+            }
+        }
+
+        if authors.is_empty() {
+            // No specific authors requested, let the database handle it
+            return ExtensionReqResult::Continue;
+        }
+
+        // For KeyPackage queries with specific authors, we could:
+        // 1. Query our Firestore/SQL backend for KeyPackages
+        // 2. Return them as additional events
+        // 3. Mark them for consumption in post_process_query_results
+        
+        // For now, we'll let the database query proceed and handle consumption
+        // in post_process_query_results
+        info!("KeyPackage REQ intercepted for session {} with authors: {:?}", session_id, authors);
+        
+        ExtensionReqResult::Continue
+    }
+
+    fn post_process_query_results(
+        &self,
+        session_id: usize,
+        subscription: &Subscription,
+        events: Vec<Event>,
+    ) -> PostProcessResult {
+        // Check if any of the events are KeyPackages (kind 443)
+        let keypackage_events: Vec<&Event> = events.iter()
+            .filter(|event| event.kind() == 443)
+            .collect();
+
+        if keypackage_events.is_empty() {
+            return PostProcessResult {
+                events,
+                consumed_events: vec![],
+            };
+        }
+
+        info!(
+            "Post-processing {} KeyPackage(s) for session {} subscription {}",
+            keypackage_events.len(),
+            session_id,
+            subscription.id
+        );
+
+        // Clone necessary data for async processing
+        let store = match self.store() {
+            Ok(store) => store.clone(),
+            Err(e) => {
+                error!("MLS Gateway not initialized: {}", e);
+                return PostProcessResult {
+                    events,
+                    consumed_events: vec![],
+                };
+            }
+        };
+
+        let events_to_consume: Vec<(String, String, String)> = keypackage_events.iter()
+            .map(|event| {
+                let event_id = hex::encode(event.id());
+                let owner_pubkey = hex::encode(event.pubkey());
+                let content = event.content().to_string();
+                (event_id, owner_pubkey, content)
+            })
+            .collect();
+        
+        let sub_id = subscription.id.clone();
+
+        // Spawn async task to handle consumption
+        tokio::spawn(async move {
+            use crate::mls_gateway::keypackage_consumer;
+            
+            for (event_id, owner_pubkey, content) in events_to_consume {
+                // Note: We can't get the requester pubkey from session_id alone
+                // For now, we'll consume any KeyPackage that's queried
+                // In production, you might want to track session->pubkey mapping
+                match keypackage_consumer::consume_keypackage(
+                    &store,
+                    &event_id,
+                    &owner_pubkey,
+                    &content,
+                ).await {
+                    Ok(true) => {
+                        info!(
+                            "KeyPackage {} consumed for subscription {}",
+                            event_id, sub_id
+                        );
+                        counter!("mls_gateway_keypackages_consumed").increment(1);
+                    }
+                    Ok(false) => {
+                        // KeyPackage was last resort, not consumed
+                        info!(
+                            "KeyPackage {} is last resort, not consumed",
+                            event_id
+                        );
+                    }
+                    Err(e) => {
+                        error!(
+                            "Failed to consume KeyPackage {}: {}",
+                            event_id, e
+                        );
+                    }
+                }
+            }
+        });
+
+        // Return all events to the client
+        // The actual consumption happens asynchronously
+        PostProcessResult {
+            events,
+            consumed_events: vec![],
+        }
     }
 }
 

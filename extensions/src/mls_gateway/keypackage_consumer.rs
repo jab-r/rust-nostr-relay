@@ -207,6 +207,33 @@ pub async fn process_keypackage_delivery(
     Ok(())
 }
 
+/// Consume a single KeyPackage
+/// Returns Ok(true) if consumed, Ok(false) if it was the last resort package
+pub async fn consume_keypackage(
+    storage: &StorageBackend,
+    event_id: &str,
+    owner_pubkey: &str,
+    _content: &str,
+) -> anyhow::Result<bool> {
+    // Check if this would be the last KeyPackage for the user
+    let count = storage.count_user_keypackages(owner_pubkey).await?;
+    
+    if count <= 1 {
+        info!("Not consuming KeyPackage {} - it's the last resort for {}", event_id, owner_pubkey);
+        return Ok(false);
+    }
+    
+    // Consume the KeyPackage
+    let deleted = storage.delete_consumed_keypackage(event_id).await?;
+    
+    if deleted {
+        info!("Consumed KeyPackage {} for owner {}", event_id, owner_pubkey);
+        counter!("mls_gateway_keypackages_consumed", "owner" => owner_pubkey.to_string()).increment(1);
+    }
+    
+    Ok(deleted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

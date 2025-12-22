@@ -18,6 +18,27 @@ impl Reader {
     }
 
     pub fn read(&self, msg: &ReadEvent) -> Result<()> {
+        // First send extension events
+        for event in &msg.extension_events {
+            let event_json = serde_json::to_string(event).unwrap_or_default();
+            self.addr.do_send(ReadEventResult {
+                id: msg.id,
+                sub_id: msg.subscription.id.clone(),
+                msg: OutgoingMessage::event(&msg.subscription.id, &event_json),
+            });
+        }
+
+        // If extension handled the request completely, just send EOSE
+        if msg.extension_handled {
+            self.addr.do_send(ReadEventResult {
+                id: msg.id,
+                sub_id: msg.subscription.id.clone(),
+                msg: OutgoingMessage::eose(&msg.subscription.id),
+            });
+            return Ok(());
+        }
+
+        // Otherwise, perform normal database query
         let reader = self.db.reader()?;
         let timeout = self.setting.read().data.db_query_timeout;
         for filter in &msg.subscription.filters {
@@ -127,6 +148,8 @@ mod tests {
                             ..Default::default()
                         }],
                     },
+                    extension_events: vec![],
+                    extension_handled: false,
                 })
                 .await?;
         }

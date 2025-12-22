@@ -359,6 +359,10 @@ pub enum WriteEventResult {
 pub struct ReadEvent {
     pub id: usize,
     pub subscription: Subscription,
+    /// Additional events provided by extensions
+    pub extension_events: Vec<Event>,
+    /// Whether extensions completely handled this request
+    pub extension_handled: bool,
 }
 
 #[derive(Message, Clone, Debug)]

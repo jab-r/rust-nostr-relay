@@ -112,6 +112,8 @@ impl Handler<ClientMessage> for Server {
                 let read_event = ReadEvent {
                     id: msg.id,
                     subscription: subscription.clone(),
+                    extension_events: vec![],
+                    extension_handled: false,
                 };
                 let sub_id = subscription.id.clone();
                 self.subscriber
