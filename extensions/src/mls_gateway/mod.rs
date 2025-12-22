@@ -13,6 +13,10 @@ pub mod endpoints;
 pub mod mailbox;
 pub mod groups;
 pub mod message_archive;
+pub mod keypackage_delivery;
+pub mod req_interceptor;
+pub mod keypackage_consumer;
+pub mod test_keypackage_flow;
 
 #[cfg(feature = "mls_gateway_firestore")]
 pub mod firestore;
@@ -31,17 +35,19 @@ pub use message_archive::MessageArchive;
 use actix_web::web::ServiceConfig;
 use nostr_relay::{Extension, Session, ExtensionMessageResult};
 use nostr_relay::db::Event;
+use nostr_relay::message::{ClientMessage, IncomingMessage, Subscription};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{info, warn, error};
 use metrics::{counter, describe_counter, describe_histogram};
+use crate::mls_gateway::keypackage_delivery::{init_delivery_store, get_delivery_store};
 
 // MLS and Noise event kinds as per specification
 const KEYPACKAGE_KIND: u16 = 443;         // MLS KeyPackage
 const WELCOME_KIND: u16 = 444;            // MLS Welcome (embedded in 1059)
 const MLS_GROUP_MESSAGE_KIND: u16 = 445;  // MLS Group Message
 const NOISE_DM_KIND: u16 = 446;           // Noise Direct Message
-const KEYPACKAGE_REQUEST_KIND: u16 = 447; // KeyPackage Request (Nostr-based)
+// Note: Kind 447 (KeyPackage Request) is deprecated - use REQ queries for kind 443 instead
 const ROSTER_POLICY_KIND: u16 = 450;      // Roster/Policy (Admin-signed membership control)
 const KEYPACKAGE_RELAYS_LIST_KIND: u16 = 10051; // KeyPackage Relays List
 const GIFTWRAP_KIND: u16 = 1059;          // Giftwrap envelope for Welcome
@@ -83,11 +89,11 @@ pub struct MlsGatewayConfig {
     pub enable_message_archive: bool,
     /// Message archive TTL in days
     pub message_archive_ttl_days: u32,
-    /// System/relay pubkey for KeyPackage requests (kind 447)
+    /// System/relay pubkey (deprecated - was used for kind 447 requests)
     pub system_pubkey: Option<String>,
     /// Admin pubkeys allowed to send roster/policy events (kind 450)
     pub admin_pubkeys: Vec<String>,
-    /// TTL for KeyPackage requests in seconds (default: 7 days)
+    /// TTL for KeyPackage requests (deprecated - kind 447 no longer supported)
     pub keypackage_request_ttl: u64,
     /// TTL for roster/policy events in days (default: indefinite/365 days)
     pub roster_policy_ttl_days: u32,
@@ -530,6 +536,9 @@ impl MlsGateway {
 
         info!("Initializing MLS Gateway Extension with {:?} backend", self.config.storage_backend);
         
+        // Initialize the delivery store
+        init_delivery_store();
+        
         // Initialize metrics
         describe_counter!("mls_gateway_events_processed", "Number of MLS events processed by kind");
         describe_counter!("mls_gateway_groups_updated", "Number of group registry updates");
@@ -546,7 +555,6 @@ impl MlsGateway {
         describe_counter!("mls_gateway_445_unexpected_tag", "Count of unexpected outer tags observed on kind 445 events");
         describe_counter!("mls_gateway_top_level_444_dropped", "Number of top-level 444 events dropped (should be wrapped in 1059)");
         describe_counter!("mls_gateway_10051_processed", "Number of KeyPackage Relays List (10051) events processed");
-        describe_counter!("mls_gateway_keypackage_requests_processed", "Number of KeyPackage requests (447) processed");
         describe_histogram!("mls_gateway_db_operation_duration", "Duration of database operations");
 
         // Initialize storage backend
@@ -905,106 +913,6 @@ impl MlsGateway {
         
         counter!("mls_gateway_events_processed", "kind" => "446").increment(1);
         Ok(())
-    }
-
-    /// Handle KeyPackage Request (kind 447)
-    async fn handle_keypackage_request(&self, event: &Event) -> anyhow::Result<()> {
-        let event_pubkey = hex::encode(event.pubkey());
-
-        // Authorization:
-        // For MLS to work, any authenticated user must be able to request keypackages
-        // to create groups and add members. This is a core user functionality, not admin-only.
-        
-        // Log the request for visibility
-        info!("KeyPackage request received from authenticated user: {}", event_pubkey);
-        
-        // If scoped to a group (h tag present), optionally verify membership
-        // But for now, allow any authenticated user to request keypackages
-        let scoped_group = event.tags().iter()
-            .find(|tag| tag.len() >= 2 && tag[0] == "h")
-            .map(|tag| tag[1].clone());
-            
-        if let Some(group_id) = &scoped_group {
-            info!("KeyPackage request scoped to group: {}", group_id);
-            // Note: We're allowing any authenticated user to request keypackages
-            // even for group-scoped requests, as they may need them to join the group
-        }
-
-        // Extract recipient from p tag
-        let recipient = event.tags().iter()
-            .find(|tag| tag.len() >= 2 && tag[0] == "p")
-            .map(|tag| tag[1].clone());
-
-        if let Some(recipient_pubkey) = recipient {
-            // Extract optional parameters
-            let group_id = event.tags().iter()
-                .find(|tag| tag.len() >= 2 && tag[0] == "h")
-                .map(|tag| tag[1].clone());
-
-            let ciphersuite = event.tags().iter()
-                .find(|tag| tag.len() >= 2 && tag[0] == "cs")
-                .map(|tag| tag[1].clone());
-
-            let min_count = event.tags().iter()
-                .find(|tag| tag.len() >= 2 && tag[0] == "min")
-                .and_then(|tag| tag[1].parse::<u32>().ok())
-                .unwrap_or(1);
-
-            let ttl = event.tags().iter()
-                .find(|tag| tag.len() >= 2 && tag[0] == "ttl")
-                .and_then(|tag| tag[1].parse::<u64>().ok())
-                .unwrap_or(self.config.keypackage_request_ttl);
-
-            // Check if request has expired
-            let now = chrono::Utc::now().timestamp() as u64;
-            let created_at = event.created_at() as u64;
-            if created_at + ttl < now {
-                warn!("KeyPackage request has expired");
-                return Err(anyhow::anyhow!("KeyPackage request has expired"));
-            }
-
-            info!("Processing KeyPackage request: recipient={}, group={:?}, ciphersuite={:?}, min={}",
-                  recipient_pubkey, group_id, ciphersuite, min_count);
-
-            // Query available keypackages for the recipient
-            // CRITICAL: Order by created_at ASC to return oldest keypackages first
-            let store = self.store()?;
-            let keypackages = store.query_keypackages(
-                Some(&[recipient_pubkey.clone()]),
-                None, // No since filter
-                Some(min_count.max(10)), // Limit to reasonable number
-                Some("created_at_asc") // Return oldest first for rotation
-            ).await?;
-
-            info!("Found {} keypackages for recipient {}", keypackages.len(), recipient_pubkey);
-
-            // Mark keypackages as consumed (except the last remaining one)
-            // As per user suggestion: "we could consider a keypackage that has been delivered by request to a client as 'consumed'"
-            let mut consumed_count = 0;
-            for (event_id, _owner, _content, _created_at) in &keypackages {
-                // Try to delete (which preserves the last remaining keypackage internally)
-                if store.delete_consumed_keypackage(event_id).await? {
-                    consumed_count += 1;
-                }
-            }
-
-            if consumed_count > 0 {
-                info!("Marked {} keypackages as consumed for recipient {} (preserving last remaining)",
-                      consumed_count, recipient_pubkey);
-                counter!("mls_gateway_keypackages_consumed").increment(consumed_count);
-            }
-
-            // Note: The actual delivery of keypackages to the requester would happen through
-            // the normal Nostr REQ/EVENT flow. The requester can query for kind 443 events
-            // authored by the recipient after making this request.
-
-            counter!("mls_gateway_keypackage_requests_processed").increment(1);
-            counter!("mls_gateway_events_processed", "kind" => "447").increment(1);
-            Ok(())
-        } else {
-            warn!("KeyPackage request missing recipient (p tag)");
-            Err(anyhow::anyhow!("Missing recipient in KeyPackage request"))
-        }
     }
 
     /// Handle KeyPackage Relays List (kind 10051)
@@ -1458,26 +1366,7 @@ impl Extension for MlsGateway {
                         }
                     });
                 }
-                KEYPACKAGE_REQUEST_KIND => {
-                    // KeyPackage Request (447)
-                    let config = self.config.clone();
-                    let store = match self.store() {
-                        Ok(store) => store.clone(),
-                        Err(e) => {
-                            error!("MLS Gateway not initialized: {}", e);
-                            return ExtensionMessageResult::Continue(msg);
-                        }
-                    };
-                    let event_clone = event.clone();
-                    tokio::spawn(async move {
-                        let mut gateway = MlsGateway::new(config);
-                        gateway.store = Some(store);
-                        gateway.initialized = true;
-                        if let Err(e) = gateway.handle_keypackage_request(&event_clone).await {
-                            error!("Error handling KeyPackage request: {}", e);
-                        }
-                    });
-                }
+                // Kind 447 (KeyPackage Request) is deprecated - use REQ queries for kind 443 instead
                 ROSTER_POLICY_KIND => {
                     // Roster/Policy (450)
                     let config = self.config.clone();

@@ -1122,6 +1122,16 @@
           "order": "DESCENDING"
         }
       ]
+    },
+    {
+      "collectionGroup": "mls_pending_deletions",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "deletion_scheduled_at",
+          "order": "ASCENDING"
+        }
+      ]
     }
   ],
   "fieldOverrides": []

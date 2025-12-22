@@ -1,4 +1,4 @@
-# NIP-EE
+# NIP-EE-RELAY
 
 ## E2EE Messaging using the Messaging Layer Security (MLS) Protocol
 
@@ -208,6 +208,84 @@ A `kind: 10051` event indicates the relays that a user will publish their KeyPac
   //...other fields
 }
 ```
+
+### KeyPackage Management and Consumption
+
+MLS-aware relays implement special handling for KeyPackage Events (kind 443) to ensure proper security semantics. The core principle is: **once a KeyPackage is exposed (returned in a query), it must be considered consumed**.
+
+#### Automatic Consumption on Query
+
+When a relay receives a REQ query for KeyPackages (kind 443), it automatically manages consumption:
+
+```
+Alice → Relay: REQ {"kinds":[443], "authors":["bob_pubkey"]}
+Relay:
+  1. Query Bob's stored KeyPackages
+  2. Apply last-resort protection (never consume the last KeyPackage)
+  3. Return available KeyPackages to Alice (max 2 per query)
+  4. Mark returned KeyPackages as consumed
+  5. Track rate limits for Alice
+Alice ← Relay: EVENT (Bob's KeyPackages)
+```
+
+This automatic consumption ensures that:
+- KeyPackages cannot be reused after exposure
+- MLS security properties are maintained at the relay level
+- Clients don't need to implement consumption logic
+
+#### Rate Limiting
+
+To prevent abuse, relays enforce rate limits on KeyPackage queries:
+- **Per requester-author pair**: Maximum 10 queries per hour
+- **KeyPackages per query**: Maximum 2 returned per query
+- **Sliding window**: Rate limits use a sliding window approach
+
+#### Last Resort Protection
+
+Relays implementing this protocol MUST maintain "last resort" protection:
+- The last remaining KeyPackage for a user is NEVER consumed
+- It may be returned in queries but remains available for future use
+- This ensures users can always receive at least one group invitation
+- Users should publish new KeyPackages before their supply drops to 1
+
+#### Relay-Initiated Replenishment
+
+MLS-aware relays monitor KeyPackage supplies and can proactively request replenishment:
+
+```
+1. Relay monitors user KeyPackage counts
+2. When a user's supply drops below threshold (e.g., 3):
+   - Relay sends REQ query to the user's client
+   - REQ {"kinds":[443], "authors":["user_pubkey"]}
+3. User's client receives the query and SHOULD:
+   - Generate fresh KeyPackages (e.g., 5-10)
+   - Publish them as kind 443 events
+4. Relay stores the new KeyPackages
+5. This relay->client query is *not* limited to 2 keypackages
+```
+
+This proactive approach ensures KeyPackage availability without requiring explicit request events.
+
+#### Client Behavior
+
+Clients implementing MLS over Nostr SHOULD:
+
+1. **Monitor KeyPackage queries**: When receiving REQ queries for their own KeyPackages, consider it a signal to replenish
+2. **Publish fresh KeyPackages**: Generate and publish 5-10 new KeyPackages when:
+   - Receiving queries for their own KeyPackages
+   - On startup if supply is low
+   - After being added to groups
+3. **Query judiciously**: Be aware that querying for KeyPackages consumes them
+
+#### Implementation Note
+
+This approach differs from traditional MLS deployments where KeyPackage consumption is explicitly signaled. In Nostr's decentralized environment, treating exposure as consumption provides stronger security guarantees and simplifies client implementation.
+
+### KeyPackage Request Event (Deprecated)
+
+**Note**: Kind 447 (KeyPackage Request) is deprecated in favor of the automatic consumption mechanism described above. MLS-aware relays use standard REQ queries to both deliver and signal the need for KeyPackages.
+
+For historical reference and backward compatibility, kind 447 was originally designed as an explicit request mechanism. New implementations should use the REQ-based approach described above.
 
 ### Welcome Event
 
