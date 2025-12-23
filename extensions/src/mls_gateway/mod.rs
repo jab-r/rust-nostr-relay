@@ -118,6 +118,8 @@ pub struct MlsGatewayConfig {
     pub backfill_max_events: u32,
     /// Maximum number of keypackages per user
     pub max_keypackages_per_user: Option<u32>,
+    /// Maximum keypackages to return per author per query (default: 1, max: 2)
+    pub max_keypackages_per_query: u32,
 }
 
 impl Default for MlsGatewayConfig {
@@ -144,6 +146,7 @@ impl Default for MlsGatewayConfig {
             backfill_kinds: vec![445, 1059, 446],
             backfill_max_events: 50000,
             max_keypackages_per_user: Some(10),
+            max_keypackages_per_query: 1,
         }
     }
 }
@@ -1457,11 +1460,47 @@ impl Extension for MlsGateway {
             };
         }
 
+        // Limit KeyPackages per author based on config and REQ filter
+        // Check if any filter specifies a limit
+        let requested_limit = subscription.filters.iter()
+            .filter_map(|f| f.limit)
+            .min()
+            .map(|l| l as usize);
+        
+        // Use config default (1) or requested limit, capped at 2
+        let max_allowed = std::cmp::min(self.config.max_keypackages_per_query as usize, 2);
+        let max_keypackages_per_author = match requested_limit {
+            Some(limit) => std::cmp::min(limit, max_allowed),
+            None => self.config.max_keypackages_per_query as usize,
+        };
+        
+        let mut keypackages_by_author: std::collections::HashMap<Vec<u8>, Vec<&Event>> = std::collections::HashMap::new();
+        
+        // Group KeyPackages by author
+        for event in &keypackage_events {
+            keypackages_by_author
+                .entry(event.pubkey().to_vec())
+                .or_insert_with(Vec::new)
+                .push(event);
+        }
+        
+        // Sort KeyPackages by created_at (oldest first) and take only the limit
+        let limited_keypackage_events: Vec<&Event> = keypackages_by_author
+            .into_iter()
+            .flat_map(|(_, mut events)| {
+                // Sort by created_at (ascending - oldest first)
+                events.sort_by_key(|e| e.created_at());
+                // Take only up to max_keypackages_per_author
+                events.into_iter().take(max_keypackages_per_author)
+            })
+            .collect();
+
         info!(
-            "Post-processing {} KeyPackage(s) for session {} subscription {}",
-            keypackage_events.len(),
+            "Post-processing {} KeyPackage(s) for session {} subscription {} (limited from {})",
+            limited_keypackage_events.len(),
             session_id,
-            subscription.id
+            subscription.id,
+            keypackage_events.len()
         );
 
         // Clone necessary data for async processing
@@ -1476,7 +1515,13 @@ impl Extension for MlsGateway {
             }
         };
 
-        let events_to_consume: Vec<(String, String, String)> = keypackage_events.iter()
+        // Build set of limited KeyPackage event IDs for filtering
+        let limited_keypackage_ids: std::collections::HashSet<[u8; 32]> = limited_keypackage_events
+            .iter()
+            .map(|e| *e.id())
+            .collect();
+
+        let events_to_consume: Vec<(String, String, String)> = limited_keypackage_events.iter()
             .map(|event| {
                 let event_id = hex::encode(event.id());
                 let owner_pubkey = hex::encode(event.pubkey());
@@ -1525,10 +1570,24 @@ impl Extension for MlsGateway {
             }
         });
 
-        // Return all events to the client
+        // Filter events to return only limited KeyPackages and non-KeyPackage events
+        let filtered_events: Vec<Event> = events
+            .into_iter()
+            .filter(|event| {
+                if event.kind() == 443 {
+                    // Only include KeyPackages that are in our limited set
+                    limited_keypackage_ids.contains(event.id())
+                } else {
+                    // Include all non-KeyPackage events
+                    true
+                }
+            })
+            .collect();
+
+        // Return filtered events to the client
         // The actual consumption happens asynchronously
         PostProcessResult {
-            events,
+            events: filtered_events,
             consumed_events: vec![],
         }
     }
