@@ -1430,24 +1430,193 @@ impl Extension for MlsGateway {
             return ExtensionReqResult::Continue;
         }
 
-        // For KeyPackage queries with specific authors, we could:
-        // 1. Query our Firestore/SQL backend for KeyPackages
-        // 2. Return them as additional events
-        // 3. Mark them for consumption in post_process_query_results
-        
-        // For now, we'll let the database query proceed and handle consumption
-        // in post_process_query_results
         info!("KeyPackage REQ intercepted for session {} with authors: {:?}", session_id, authors);
-        
-        ExtensionReqResult::Continue
+
+        // Clone necessary data for async operation
+        let store = match self.store() {
+            Ok(store) => store.clone(),
+            Err(e) => {
+                error!("MLS Gateway not initialized: {}", e);
+                return ExtensionReqResult::Continue;
+            }
+        };
+
+        // Get since timestamp from filters
+        let since = subscription.filters.iter()
+            .filter_map(|f| f.since)
+            .max()
+            .unwrap_or(0);
+
+        // Get limit from filters
+        let limit = subscription.filters.iter()
+            .filter_map(|f| f.limit)
+            .min()
+            .map(|l| l as usize)
+            .unwrap_or(1);  // Default to 1 when no limit specified per NIP-EE-RELAY
+
+        // Enforce max_keypackages_per_query config (default: 1, max: 2)
+        let max_keypackages_per_query = self.config.max_keypackages_per_query;
+        let query_limit = (limit as u32).min(max_keypackages_per_query).min(2);
+
+        // Create a new single-threaded runtime for the blocking operation
+        let firestore_events = match std::thread::spawn(move || {
+            // Create a new runtime in this thread
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create runtime");
+            
+            runtime.block_on(async move {
+                info!("Querying Firestore for KeyPackages with authors: {:?}, limit: {}", authors, query_limit);
+                match store.query_keypackages(
+                    Some(&authors),
+                    Some(since as i64),
+                    Some(query_limit),
+                    Some("created_at_asc"),
+                ).await {
+                    Ok(keypackages) => {
+                        info!("Found {} KeyPackages in Firestore", keypackages.len());
+                        
+                        // Convert Firestore keypackages to Events
+                        // We need to reconstruct the full event from Firestore data
+                        let mut events = Vec::new();
+                        for (event_id, owner_pubkey, keypackage_content, created_at) in keypackages {
+                            // Reconstruct the event JSON
+                            let event_json = serde_json::json!({
+                                "id": event_id,
+                                "pubkey": owner_pubkey,
+                                "created_at": created_at,
+                                "kind": 443,
+                                "content": keypackage_content,
+                                "tags": [],  // We don't store tags separately, but they're not needed for delivery
+                                "sig": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"    // Dummy signature - client doesn't verify on receipt
+                            });
+                            
+                            match serde_json::from_value::<Event>(event_json) {
+                                Ok(event) => {
+                                    info!("Successfully reconstructed KeyPackage event {}", event_id);
+                                    events.push(event);
+                                }
+                                Err(e) => error!("Failed to reconstruct KeyPackage event {}: {}", event_id, e),
+                            }
+                        }
+                        events
+                    }
+                    Err(e) => {
+                        error!("Failed to query Firestore for KeyPackages: {}", e);
+                        Vec::new()
+                    }
+                }
+            })
+        }).join() {
+            Ok(events) => events,
+            Err(e) => {
+                error!("Thread panic while querying Firestore: {:?}", e);
+                Vec::new()
+            }
+        };
+
+        if firestore_events.is_empty() {
+            info!("No KeyPackages found in Firestore, continuing with LMDB query");
+            ExtensionReqResult::Continue
+        } else {
+            info!("Returning {} KeyPackages from Firestore", firestore_events.len());
+            ExtensionReqResult::Handle(firestore_events)
+        }
     }
 
     fn post_process_query_results(
         &self,
         session_id: usize,
         subscription: &Subscription,
-        events: Vec<Event>,
+        mut events: Vec<Event>,
     ) -> PostProcessResult {
+        // Check if this is a keypackage query
+        let is_keypackage_query = subscription.filters.iter().any(|filter| {
+            filter.kinds.iter().any(|&k| k == 443)
+        });
+
+        // If it's a keypackage query and we got no results, query Firestore
+        if is_keypackage_query && events.iter().filter(|e| e.kind() == 443).count() == 0 {
+            // Extract authors from filters
+            let mut authors: Vec<String> = Vec::new();
+            for filter in &subscription.filters {
+                for author in filter.authors.iter() {
+                    authors.push(hex::encode(author));
+                }
+            }
+
+            if !authors.is_empty() {
+                info!(
+                    "No KeyPackages found in LMDB for session {}, querying Firestore for authors: {:?}",
+                    session_id, authors
+                );
+
+                // Clone necessary data for async operation
+                let store = match self.store() {
+                    Ok(store) => store.clone(),
+                    Err(e) => {
+                        error!("MLS Gateway not initialized: {}", e);
+                        return PostProcessResult {
+                            events,
+                            consumed_events: vec![],
+                        };
+                    }
+                };
+
+                // Get since timestamp from filters
+                let since = subscription.filters.iter()
+                    .filter_map(|f| f.since)
+                    .max()
+                    .unwrap_or(0);
+
+                // Get limit from filters
+                let limit = subscription.filters.iter()
+                    .filter_map(|f| f.limit)
+                    .min()
+                    .map(|l| l as usize)
+                    .unwrap_or(100);
+
+                // Query Firestore synchronously using blocking
+                let firestore_events = tokio::task::block_in_place(move || {
+                    let runtime = tokio::runtime::Handle::current();
+                    runtime.block_on(async move {
+                        match store.query_keypackages(
+                            Some(&authors),
+                            Some(since as i64),
+                            Some(limit.min(u32::MAX as usize) as u32),
+                            Some("created_at_asc"),
+                        ).await {
+                            Ok(keypackages) => {
+                                info!("Found {} KeyPackages in Firestore", keypackages.len());
+                                
+                                // Convert Firestore keypackages to Events
+                                let mut firestore_events = Vec::new();
+                                for (event_id, _owner, content, _created_at) in keypackages {
+                                    // The content field contains the full event JSON
+                                    match serde_json::from_str::<Event>(&content) {
+                                        Ok(event) => {
+                                            info!("Successfully parsed KeyPackage event {}", event_id);
+                                            firestore_events.push(event);
+                                        }
+                                        Err(e) => error!("Failed to parse KeyPackage event {}: {}", event_id, e),
+                                    }
+                                }
+                                firestore_events
+                            }
+                            Err(e) => {
+                                error!("Failed to query Firestore for KeyPackages: {}", e);
+                                Vec::new()
+                            }
+                        }
+                    })
+                });
+
+                // Add Firestore events to the results
+                events.extend(firestore_events);
+            }
+        }
+
         // Check if any of the events are KeyPackages (kind 443)
         let keypackage_events: Vec<&Event> = events.iter()
             .filter(|event| event.kind() == 443)

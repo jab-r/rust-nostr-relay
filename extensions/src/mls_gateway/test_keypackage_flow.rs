@@ -43,6 +43,13 @@ mod tests {
     }
     
     fn create_test_keypackage(author: &str, content: &str) -> Event {
+        let fake_sig = hex::encode([0u8; 64]); // 64 bytes = 128 hex chars
+        let author_pubkey = if author.len() == 64 {
+            author.to_string()
+        } else {
+            hex::encode([0u8; 32]) // Use zero pubkey if not provided
+        };
+        
         Event::from_str(&format!(r#"{{
             "id": "{}",
             "pubkey": "{}",
@@ -55,16 +62,29 @@ mod tests {
                 ["relays", "wss://relay1.example.com", "wss://relay2.example.com"]
             ],
             "content": "{}",
-            "sig": "fake_signature"
+            "sig": "{}"
         }}"#,
             hex::encode([0u8; 32]), // Use deterministic ID for tests
-            author,
+            author_pubkey,
             chrono::Utc::now().timestamp(),
-            content
+            content,
+            fake_sig
         )).unwrap()
     }
     
     fn create_keypackage_request(requester: &str, target: &str) -> Event {
+        let fake_sig = hex::encode([0u8; 64]); // 64 bytes = 128 hex chars
+        let requester_pubkey = if requester.len() == 64 {
+            requester.to_string()
+        } else {
+            hex::encode([1u8; 32]) // Use different pubkey for requester
+        };
+        let target_pubkey = if target.len() == 64 {
+            target.to_string()
+        } else {
+            hex::encode([2u8; 32]) // Use different pubkey for target
+        };
+        
         Event::from_str(&format!(r#"{{
             "id": "{}",
             "pubkey": "{}",
@@ -75,12 +95,13 @@ mod tests {
                 ["min", "2"]
             ],
             "content": "",
-            "sig": "fake_signature"
+            "sig": "{}"
         }}"#,
             hex::encode([1u8; 32]), // Use deterministic ID for tests
-            requester,
+            requester_pubkey,
             chrono::Utc::now().timestamp(),
-            target
+            target_pubkey,
+            fake_sig
         )).unwrap()
     }
 }
