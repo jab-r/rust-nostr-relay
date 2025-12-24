@@ -30,8 +30,16 @@ pub async fn run_cleanup() -> Result<()> {
     // Initialize Firestore storage
     let storage = FirestoreStorage::new(&project_id).await?;
     
+    // Get max keypackages per user from environment or use default
+    let max_per_user = std::env::var("MLS_MAX_KEYPACKAGES_PER_USER")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(15);
+    
+    info!("Running cleanup with max_keypackages_per_user: {}", max_per_user);
+    
     // Run cleanup
-    match storage.cleanup_expired_keypackages().await {
+    match storage.cleanup_expired_keypackages(max_per_user).await {
         Ok(deleted_count) => {
             info!("Cleanup complete: deleted {} expired keypackages", deleted_count);
             Ok(())
