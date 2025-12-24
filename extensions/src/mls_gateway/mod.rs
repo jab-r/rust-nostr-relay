@@ -145,7 +145,7 @@ impl Default for MlsGatewayConfig {
             backfill_on_startup: true,
             backfill_kinds: vec![445, 1059, 446],
             backfill_max_events: 50000,
-            max_keypackages_per_user: Some(10),
+            max_keypackages_per_user: Some(15),
             max_keypackages_per_query: 1,
         }
     }
@@ -218,8 +218,8 @@ pub trait MlsStorage: Send + Sync {
     /// Count keypackages per user
     async fn count_user_keypackages(&self, owner_pubkey: &str) -> anyhow::Result<u32>;
     
-    /// Clean up expired keypackages
-    async fn cleanup_expired_keypackages(&self) -> anyhow::Result<u32>;
+    /// Clean up expired keypackages and enforce per-user limits
+    async fn cleanup_expired_keypackages(&self, max_per_user: u32) -> anyhow::Result<u32>;
 
     // New methods for pending deletion management
     
@@ -441,12 +441,12 @@ impl StorageBackend {
         }
     }
 
-    async fn cleanup_expired_keypackages(&self) -> anyhow::Result<u32> {
+    async fn cleanup_expired_keypackages(&self, max_per_user: u32) -> anyhow::Result<u32> {
         match self {
             #[cfg(feature = "mls_gateway_sql")]
-            StorageBackend::Sql(storage) => storage.cleanup_expired_keypackages().await,
+            StorageBackend::Sql(storage) => storage.cleanup_expired_keypackages(max_per_user).await,
             #[cfg(feature = "mls_gateway_firestore")]
-            StorageBackend::Firestore(storage) => storage.cleanup_expired_keypackages().await,
+            StorageBackend::Firestore(storage) => storage.cleanup_expired_keypackages(max_per_user).await,
         }
     }
 
@@ -551,6 +551,7 @@ impl MlsGateway {
         describe_counter!("mls_gateway_keypackages_stored", "Number of key packages stored");
         describe_counter!("mls_gateway_keypackages_consumed", "Number of key packages consumed by requests");
         describe_counter!("mls_gateway_keypackages_expired_cleanup", "Number of expired key packages cleaned up");
+        describe_counter!("mls_gateway_keypackages_pruned_for_limit", "Number of keypackages pruned to enforce per-user limit");
         describe_counter!("mls_gateway_welcomes_stored", "Number of welcome messages stored");
         describe_counter!("mls_gateway_giftwarps_processed", "Number of giftwrap envelopes processed");
         describe_counter!("mls_gateway_membership_updates", "Number of membership updates from giftwarps");
@@ -637,11 +638,12 @@ impl MlsGateway {
         
         // Spawn background task for periodic keypackage cleanup
         let cleanup_store = store;
+        let max_keypackages_per_user = self.config.max_keypackages_per_user.unwrap_or(15);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600)); // Run every hour
             loop {
                 interval.tick().await;
-                match cleanup_store.cleanup_expired_keypackages().await {
+                match cleanup_store.cleanup_expired_keypackages(max_keypackages_per_user).await {
                     Ok(count) => {
                         if count > 0 {
                             info!("Cleaned up {} expired keypackages", count);
@@ -761,14 +763,9 @@ impl MlsGateway {
             return Err(anyhow::anyhow!("Invalid keypackage content format"));
         }
 
-        // Check per-user limits (if configured)
-        let max_keypackages = self.config.max_keypackages_per_user.unwrap_or(10);
+        // Get current count for last resort detection (no limit enforcement)
         let current_count = store.count_user_keypackages(&event_pubkey).await?;
-        if current_count >= max_keypackages {
-            warn!("User {} has reached keypackage limit ({} >= {})", event_pubkey, current_count, max_keypackages);
-            return Err(anyhow::anyhow!("User keypackage limit exceeded"));
-        }
-
+        
         // Check if this is a last resort scenario (user had exactly 1 keypackage before this upload)
         let should_start_timer = current_count == 1;
         let oldest_keypackage_id = if should_start_timer {

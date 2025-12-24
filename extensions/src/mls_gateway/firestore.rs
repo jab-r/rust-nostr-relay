@@ -9,7 +9,8 @@
 use firestore::*;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tracing::{info, instrument};
+use tracing::{info, debug, instrument};
+use metrics::counter;
 use anyhow::Result;
 use async_trait::async_trait;
 use crate::mls_gateway::MlsStorage;
@@ -203,12 +204,14 @@ impl FirestoreStorage {
         Ok(self.fetch_group(group_id).await?.map(|g| g.service_member).unwrap_or(false))
     }
     
-    /// Clean up expired keypackages - should be run daily
-    pub async fn cleanup_expired_keypackages(&self) -> Result<u32> {
+    /// Clean up expired keypackages and enforce per-user limits - should be run daily
+    pub async fn cleanup_expired_keypackages(&self, max_per_user: u32) -> Result<u32> {
         let now = Utc::now();
-        info!("Starting cleanup of expired keypackages");
+        info!("Starting keypackage cleanup - removing expired and enforcing {} per user limit", max_per_user);
         
-        // Query for expired keypackages
+        let mut total_deleted = 0;
+        
+        // Step 1: Delete expired keypackages
         let expired_docs = self.db
             .fluent()
             .select()
@@ -217,7 +220,6 @@ impl FirestoreStorage {
             .query()
             .await?;
         
-        let mut deleted = 0;
         for doc in expired_docs {
             if let Ok(kp) = firestore::FirestoreDb::deserialize_doc_to::<KeyPackageDoc>(&doc) {
                 // Delete the expired keypackage
@@ -229,14 +231,79 @@ impl FirestoreStorage {
                     .execute()
                     .await
                 {
-                    deleted += 1;
+                    total_deleted += 1;
                     info!("Deleted expired keypackage {} for owner {}", kp.event_id, kp.owner_pubkey);
                 }
             }
         }
         
-        info!("Cleanup complete: deleted {} expired keypackages", deleted);
-        Ok(deleted)
+        // Step 2: Enforce per-user limits by pruning oldest keypackages
+        let pruned = self.prune_excess_keypackages(max_per_user).await?;
+        total_deleted += pruned;
+        
+        info!("Cleanup complete: deleted {} total keypackages ({} expired, {} pruned for limits)",
+              total_deleted, total_deleted - pruned, pruned);
+        Ok(total_deleted)
+    }
+    
+    /// Prune excess keypackages to enforce per-user limits
+    async fn prune_excess_keypackages(&self, max_per_user: u32) -> Result<u32> {
+        // Get all keypackages grouped by owner to find those over limit
+        let all_docs = self.db
+            .fluent()
+            .select()
+            .from("mls_keypackages")
+            .query()
+            .await?;
+        
+        // Group by owner_pubkey
+        let mut keypackages_by_owner: std::collections::HashMap<String, Vec<KeyPackageDoc>> =
+            std::collections::HashMap::new();
+        
+        for doc in all_docs {
+            if let Ok(kp) = firestore::FirestoreDb::deserialize_doc_to::<KeyPackageDoc>(&doc) {
+                keypackages_by_owner.entry(kp.owner_pubkey.clone())
+                    .or_insert_with(Vec::new)
+                    .push(kp);
+            }
+        }
+        
+        let mut pruned = 0;
+        
+        // Process each owner who has too many keypackages
+        for (owner_pubkey, mut keypackages) in keypackages_by_owner {
+            let count = keypackages.len();
+            if count > max_per_user as usize {
+                let to_delete = count - max_per_user as usize;
+                info!("User {} has {} keypackages, pruning {} oldest ones",
+                      owner_pubkey, count, to_delete);
+                
+                // Sort by created_at ascending (oldest first)
+                keypackages.sort_by_key(|kp| kp.created_at);
+                
+                // Delete the oldest ones
+                for kp in keypackages.into_iter().take(to_delete) {
+                    if let Ok(_) = self.db
+                        .fluent()
+                        .delete()
+                        .from("mls_keypackages")
+                        .document_id(&kp.event_id)
+                        .execute()
+                        .await
+                    {
+                        pruned += 1;
+                        debug!("Pruned old keypackage {} for user {}", kp.event_id, owner_pubkey);
+                    }
+                }
+            }
+        }
+        
+        if pruned > 0 {
+            info!("Pruned {} keypackages to enforce per-user limits", pruned);
+            counter!("mls_gateway_keypackages_pruned_for_limit").increment(pruned as u64);
+        }
+        
+        Ok(pruned)
     }
 
     /// Create a pending deletion record for last resort keypackage
@@ -694,70 +761,10 @@ impl MlsStorage for FirestoreStorage {
         Ok(docs.len() as u32)
     }
 
-    async fn cleanup_expired_keypackages(&self) -> anyhow::Result<u32> {
-        let now = Utc::now();
-        
-        // Query for expired keypackages
-        let expired_docs = self.db
-            .fluent()
-            .select()
-            .from("mls_keypackages")
-            .filter(|f| f.field("expires_at").less_than_or_equal(now))
-            .query()
-            .await?;
-
-        let mut deleted_count = 0u32;
-
-        // Group expired keypackages by owner
-        let mut expired_by_owner: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
-        
-        for doc in expired_docs {
-            if let Ok(kp) = firestore::FirestoreDb::deserialize_doc_to::<KeyPackageDoc>(&doc) {
-                expired_by_owner.entry(kp.owner_pubkey.clone())
-                    .or_insert_with(Vec::new)
-                    .push(kp.event_id);
-            }
-        }
-
-        // For each owner, delete expired keypackages but preserve at least one
-        for (owner_pubkey, expired_ids) in expired_by_owner {
-            // Count total valid keypackages for this user
-            let total_count = self.count_user_keypackages(&owner_pubkey).await?;
-            
-            // Calculate how many we can safely delete while keeping at least one
-            let deletable_count = if total_count > expired_ids.len() as u32 {
-                // User has non-expired keypackages, can delete all expired
-                expired_ids.len()
-            } else {
-                // All keypackages are expired, keep at least one
-                expired_ids.len().saturating_sub(1)
-            };
-            
-            // Delete the deletable expired keypackages
-            for (i, event_id) in expired_ids.iter().enumerate() {
-                if i < deletable_count {
-                    if let Ok(_) = self.db
-                        .fluent()
-                        .delete()
-                        .from("mls_keypackages")
-                        .document_id(event_id)
-                        .execute()
-                        .await
-                    {
-                        deleted_count += 1;
-                    }
-                } else {
-                    info!("Preserving expired keypackage {} as last remaining for user {}",
-                          event_id, owner_pubkey);
-                }
-            }
-        }
-
-        if deleted_count > 0 {
-            info!("Cleaned up {} expired keypackages", deleted_count);
-        }
-
-        Ok(deleted_count)
+    async fn cleanup_expired_keypackages(&self, max_per_user: u32) -> anyhow::Result<u32> {
+        // Delegate to the public method
+        FirestoreStorage::cleanup_expired_keypackages(self, max_per_user).await
+            .map_err(|e| anyhow::anyhow!(e))
     }
     
     // New methods for pending deletion management
