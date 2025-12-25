@@ -8,6 +8,16 @@ This NIP standardizes how to use the [MLS Protocol](https://www.rfc-editor.org/r
 
 ## Context
 
+This NIP is intended to supercede NIP-EE which has been withdrawn (made redundant), and that the same time solve the problem of providing keypackages for offline users, allowing MLS group formation, as well as keeping track of keypackage usage. 
+
+For the purpose of keypackage rotation, once a keypackage has `seen the light` it is considered `consumed` by the compliant relay which does not again provide this keypackage unless it is the `last resort`. 
+
+The relay expects clients to supply fresh keypackages on startup, and then REQ keypackages from the client to replenish as needed. 
+
+Clients obtain peer keypackages by REQ queries. The implemented relay intercepts kind 443 queries to provide synthetic events returning keypackages.
+
+This document is an extension of the original NIP-EE.md
+
 Originally, one-to-one direct messages (DMs) in Nostr happened via the scheme defined in [NIP-04](04.md). This NIP is not recommended because, while it encrypts the content of the message (provides decent confidentiality), it leaks significant amounts of metadata about the parties involved in the conversation (completely lacks privacy).
 
 With the addition of [NIP-44](44.md), we have an updated encryption scheme that improves confidentiality guarantees but stops short of defining a new scheme for doing direct messages using this encryption scheme. Hence, makes little to no difference to privacy.
@@ -166,6 +176,7 @@ In most cases, it's assumed that clients implementing this NIP will manage the c
     "tags": [
         ["mls_protocol_version", "1.0"],
         ["ciphersuite", <MLS CipherSuite ID value e.g. "0x0001">],
+        ["encoding", "base64"],
         ["extensions", <An array of MLS Extension ID values e.g. "0x0001, 0x0002">],
         ["client", <client name>, <handler event id>, <optional relay url>],
         ["relays", <array of relay urls>],
@@ -175,10 +186,13 @@ In most cases, it's assumed that clients implementing this NIP will manage the c
 }
 ```
 
-- The `content` hex encoded serialized `KeyPackageBundle` from MLS.
+- The `content` field contains the serialized `KeyPackageBundle` from MLS.
+  - New implementations SHOULD use **base64** encoding and include `["encoding","base64"]`.
+  - Legacy implementations MAY omit the tag and use hex (for backward compatibility).
 - The `mls_protocol_version` tag is required and MUST be the version number of the MLS protocol version being used. For now, this is `1.0`.
 - The `ciphersuite` tag is the value of the MLS ciphersuite that this KeyPackage Event supports. [Read more about ciphersuites in MLS](https://www.rfc-editor.org/rfc/rfc9420.html#name-mls-cipher-suites).
 - The `extensions` tag is an array of MLS extension IDs that this KeyPackage Event supports. [Read more about MLS extensions](https://www.rfc-editor.org/rfc/rfc9420.html#name-extensions).
+- The `encoding` tag when present and with valud `base64` indicates the content is a base64 encoded keypackage, otherwise context is a hex encoded keypackge.
 - (optional) The `client` tag helps other clients manage the user experience when they receive group invites but don't have access to the signing key.
 - The `relays` tag identifies each of the relays that the client will attempt to publish this KeyPackage event. This allows for deletion of KeyPackage Events at a later date.
 - (optional) The `-` tag can be used to ensure that KeyPackage Events are only published by their authenticated author. Read more in [NIP-70](70.md)
@@ -226,6 +240,21 @@ Relay:
   4. Mark returned KeyPackages as consumed
   5. Track rate limits for Alice
 Alice ← Relay: EVENT (Bob's KeyPackages)
+
+##### Requesting base64 output
+
+Relays MAY support a request-side output hint for `kind:443` queries using a single-letter tag filter:
+
+```json
+["REQ","sub",{"kinds":[443],"authors":["bob_pubkey"],"#f":["base64"]}]
+```
+
+When `#f:["base64"]` is present:
+
+- returned 443 events use base64 in `content`
+- returned events include tag `["encoding","base64"]`
+
+If the hint is absent, relays return hex in `content` by default for backward compatibility.
 ```
 
 This automatic consumption ensures that:

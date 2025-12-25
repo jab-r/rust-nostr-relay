@@ -175,7 +175,9 @@ In most cases, it's assumed that clients implementing this NIP will manage the c
 }
 ```
 
-- The `content` hex encoded serialized `KeyPackageBundle` from MLS.
+- The `content` field contains the serialized `KeyPackageBundle` from MLS.
+  - New implementations SHOULD use **base64** encoding and include `["encoding","base64"]`.
+  - Legacy implementations MAY omit the tag and use hex (for backward compatibility).
 - The `mls_protocol_version` tag is required and MUST be the version number of the MLS protocol version being used. For now, this is `1.0`.
 - The `ciphersuite` tag is the value of the MLS ciphersuite that this KeyPackage Event supports. [Read more about ciphersuites in MLS](https://www.rfc-editor.org/rfc/rfc9420.html#name-mls-cipher-suites).
 - The `extensions` tag is an array of MLS extension IDs that this KeyPackage Event supports. [Read more about MLS extensions](https://www.rfc-editor.org/rfc/rfc9420.html#name-extensions).
@@ -226,6 +228,21 @@ Relay:
   4. Mark returned KeyPackages as consumed
   5. Track rate limits for Alice
 Alice ← Relay: EVENT (Bob's KeyPackages)
+
+##### Requesting base64 output
+
+Relays MAY support a request-side output hint for `kind:443` queries using a single-letter tag filter:
+
+```json
+["REQ","sub",{"kinds":[443],"authors":["bob_pubkey"],"#f":["base64"]}]
+```
+
+When `#f:["base64"]` is present:
+
+- returned 443 events use base64 in `content`
+- returned events include tag `["encoding","base64"]`
+
+If the hint is absent, relays return hex in `content` by default for backward compatibility.
 ```
 
 This automatic consumption ensures that:

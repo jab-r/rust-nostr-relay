@@ -18,6 +18,8 @@ pub mod req_interceptor;
 pub mod keypackage_consumer;
 pub mod test_keypackage_flow;
 
+mod keypackage_encoding;
+
 #[cfg(test)]
 pub mod test_req_interception;
 
@@ -54,6 +56,60 @@ const NOISE_DM_KIND: u16 = 446;           // Noise Direct Message
 const ROSTER_POLICY_KIND: u16 = 450;      // Roster/Policy (Admin-signed membership control)
 const KEYPACKAGE_RELAYS_LIST_KIND: u16 = 10051; // KeyPackage Relays List
 const GIFTWRAP_KIND: u16 = 1059;          // Giftwrap envelope for Welcome
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyPackageOutputEncoding {
+    Hex,
+    Base64,
+}
+
+fn keypackage_output_encoding(subscription: &Subscription) -> KeyPackageOutputEncoding {
+    let key = b"f".to_vec();
+    for filter in &subscription.filters {
+        if let Some(values) = filter.tags.get(&key) {
+            // Treat #f:["base64"] as an output-format hint for kind 443 queries.
+            if values
+                .iter()
+                .any(|v| v.as_slice().eq_ignore_ascii_case(b"base64"))
+            {
+                return KeyPackageOutputEncoding::Base64;
+            }
+        }
+    }
+    KeyPackageOutputEncoding::Hex
+}
+
+fn build_synthetic_keypackage_event(
+    event_id: &str,
+    owner_pubkey: &str,
+    created_at: i64,
+    firestore_content: &str,
+    output: KeyPackageOutputEncoding,
+) -> anyhow::Result<Event> {
+    let (content, tags) = match output {
+        KeyPackageOutputEncoding::Hex => (
+            crate::mls_gateway::keypackage_encoding::hex_from_firestore_content(firestore_content)?,
+            serde_json::json!([]),
+        ),
+        KeyPackageOutputEncoding::Base64 => (
+            crate::mls_gateway::keypackage_encoding::base64_from_firestore_content(firestore_content)?,
+            serde_json::json!([["encoding", "base64"]]),
+        ),
+    };
+
+    let event_json = serde_json::json!({
+        "id": event_id,
+        "pubkey": owner_pubkey,
+        "created_at": created_at,
+        "kind": 443,
+        "content": content,
+        "tags": tags,
+        "sig": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+    });
+
+    serde_json::from_value::<Event>(event_json)
+        .map_err(|e| anyhow::anyhow!("Failed to construct synthetic keypackage event {event_id}: {e}"))
+}
 
 /// Storage backend type configuration
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -558,7 +614,8 @@ impl MlsGateway {
         // Validation/hygiene counters
         describe_counter!("mls_gateway_443_missing_tag", "Count of KeyPackage events missing required tags");
         describe_counter!("mls_gateway_443_invalid_tag", "Count of KeyPackage events with invalid tag values");
-        describe_counter!("mls_gateway_443_content_invalid", "Count of KeyPackage events with invalid hex content");
+        describe_counter!("mls_gateway_443_content_invalid", "Count of KeyPackage events with invalid content (decode failure)");
+        describe_counter!("mls_gateway_443_ingest", "Count of inbound KeyPackage (443) ingests by declared encoding");
         describe_counter!("mls_gateway_445_unexpected_tag", "Count of unexpected outer tags observed on kind 445 events");
         describe_counter!("mls_gateway_top_level_444_dropped", "Number of top-level 444 events dropped (should be wrapped in 1059)");
         describe_counter!("mls_gateway_10051_processed", "Number of KeyPackage Relays List (10051) events processed");
@@ -754,14 +811,18 @@ impl MlsGateway {
             counter!("mls_gateway_443_missing_tag").increment(1);
         }
 
-        // Content shape: expect hex-encoded KeyPackageBundle (soft check)
+        // Content: accept hex by default (no encoding tag), accept base64 when encoding=base64.
+        // Always store canonical standard base64 in Firestore.
         let content = event.content().trim();
-        let is_hex = !content.is_empty() && content.len() % 2 == 0 && content.bytes().all(|b| (b as char).is_ascii_hexdigit());
-        if !is_hex {
-            warn!("KeyPackage content is not valid hex payload (soft validation)");
-            counter!("mls_gateway_443_content_invalid").increment(1);
-            return Err(anyhow::anyhow!("Invalid keypackage content format"));
-        }
+        let (declared_encoding, content_b64) = match crate::mls_gateway::keypackage_encoding::canonical_base64_from_event(event.tags(), content) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("KeyPackage content decode failed (declared encoding): {}", e);
+                counter!("mls_gateway_443_content_invalid").increment(1);
+                return Err(anyhow::anyhow!("Invalid keypackage content"));
+            }
+        };
+        counter!("mls_gateway_443_ingest", "encoding" => declared_encoding.as_str().to_string()).increment(1);
 
         // Get current count for last resort detection (no limit enforcement)
         let current_count = store.count_user_keypackages(&event_pubkey).await?;
@@ -790,7 +851,7 @@ impl MlsGateway {
         store.store_keypackage(
             &event.id_str(),
             &event_pubkey,
-            content,
+            &content_b64,
             &ciphersuite.unwrap_or_default(),
             &extensions.unwrap_or_default(),
             &all_relays,
@@ -1455,6 +1516,8 @@ impl Extension for MlsGateway {
         let max_keypackages_per_query = self.config.max_keypackages_per_query;
         let query_limit = (limit as u32).min(max_keypackages_per_query).min(2);
 
+        let output = keypackage_output_encoding(subscription);
+
         // Create a new single-threaded runtime for the blocking operation
         let firestore_events = match std::thread::spawn(move || {
             // Create a new runtime in this thread
@@ -1478,23 +1541,21 @@ impl Extension for MlsGateway {
                         // We need to reconstruct the full event from Firestore data
                         let mut events = Vec::new();
                         for (event_id, owner_pubkey, keypackage_content, created_at) in keypackages {
-                            // Reconstruct the event JSON
-                            let event_json = serde_json::json!({
-                                "id": event_id,
-                                "pubkey": owner_pubkey,
-                                "created_at": created_at,
-                                "kind": 443,
-                                "content": keypackage_content,
-                                "tags": [],  // We don't store tags separately, but they're not needed for delivery
-                                "sig": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"    // Dummy signature - client doesn't verify on receipt
-                            });
-                            
-                            match serde_json::from_value::<Event>(event_json) {
+                            match build_synthetic_keypackage_event(
+                                &event_id,
+                                &owner_pubkey,
+                                created_at,
+                                &keypackage_content,
+                                output,
+                            ) {
                                 Ok(event) => {
                                     info!("Successfully reconstructed KeyPackage event {}", event_id);
                                     events.push(event);
                                 }
-                                Err(e) => error!("Failed to reconstruct KeyPackage event {}: {}", event_id, e),
+                                Err(e) => {
+                                    error!("{}", e);
+                                    counter!("mls_gateway_443_content_invalid").increment(1);
+                                }
                             }
                         }
                         events
@@ -1544,6 +1605,7 @@ impl Extension for MlsGateway {
             }
 
             if !authors.is_empty() {
+                let output = keypackage_output_encoding(subscription);
                 info!(
                     "No KeyPackages found in LMDB for session {}, querying Firestore for authors: {:?}",
                     session_id, authors
@@ -1589,14 +1651,22 @@ impl Extension for MlsGateway {
                                 
                                 // Convert Firestore keypackages to Events
                                 let mut firestore_events = Vec::new();
-                                for (event_id, _owner, content, _created_at) in keypackages {
-                                    // The content field contains the full event JSON
-                                    match serde_json::from_str::<Event>(&content) {
+                                for (event_id, owner_pubkey, keypackage_content, created_at) in keypackages {
+                                    match build_synthetic_keypackage_event(
+                                        &event_id,
+                                        &owner_pubkey,
+                                        created_at,
+                                        &keypackage_content,
+                                        output,
+                                    ) {
                                         Ok(event) => {
-                                            info!("Successfully parsed KeyPackage event {}", event_id);
+                                            info!("Successfully reconstructed KeyPackage event {}", event_id);
                                             firestore_events.push(event);
                                         }
-                                        Err(e) => error!("Failed to parse KeyPackage event {}: {}", event_id, e),
+                                        Err(e) => {
+                                            error!("{}", e);
+                                            counter!("mls_gateway_443_content_invalid").increment(1);
+                                        }
                                     }
                                 }
                                 firestore_events
@@ -1860,6 +1930,71 @@ mod tests {
     use super::*;
     use nostr_relay::db::Event;
     use chrono::Utc;
+
+    #[test]
+    fn test_keypackage_output_encoding_default_hex() {
+        let subscription = Subscription { id: "s".into(), filters: vec![] };
+        assert_eq!(keypackage_output_encoding(&subscription), KeyPackageOutputEncoding::Hex);
+    }
+
+    #[test]
+    fn test_keypackage_output_encoding_base64_via_f_tag() {
+        let mut filter = nostr_relay::db::Filter::default();
+        filter.set_tags(std::collections::HashMap::from([(
+            "f".to_string(),
+            vec!["base64".to_string()],
+        )]));
+        let subscription = Subscription { id: "s".into(), filters: vec![filter] };
+        assert_eq!(keypackage_output_encoding(&subscription), KeyPackageOutputEncoding::Base64);
+    }
+
+    #[test]
+    fn test_build_synthetic_keypackage_event_base64_includes_encoding_tag() {
+        let event_id = &hex::encode([0u8; 32]);
+        let owner_pubkey = &hex::encode([1u8; 32]);
+        let created_at = 1700000000i64;
+        let firestore_content = "SGVsbG8=";
+
+        let event = build_synthetic_keypackage_event(
+            event_id,
+            owner_pubkey,
+            created_at,
+            firestore_content,
+            KeyPackageOutputEncoding::Base64,
+        )
+        .unwrap();
+
+        assert_eq!(event.kind(), 443);
+        assert_eq!(event.content(), "SGVsbG8=");
+        assert!(event
+            .tags()
+            .iter()
+            .any(|t| t.len() >= 2 && t[0] == "encoding" && t[1] == "base64"));
+    }
+
+    #[test]
+    fn test_build_synthetic_keypackage_event_hex_has_no_encoding_tag() {
+        let event_id = &hex::encode([2u8; 32]);
+        let owner_pubkey = &hex::encode([3u8; 32]);
+        let created_at = 1700000000i64;
+        let firestore_content = "SGVsbG8=";
+
+        let event = build_synthetic_keypackage_event(
+            event_id,
+            owner_pubkey,
+            created_at,
+            firestore_content,
+            KeyPackageOutputEncoding::Hex,
+        )
+        .unwrap();
+
+        assert_eq!(event.kind(), 443);
+        assert_eq!(event.content(), "48656c6c6f");
+        assert!(!event
+            .tags()
+            .iter()
+            .any(|t| t.len() >= 2 && t[0] == "encoding"));
+    }
     
     // Mock storage backend for testing
     struct MockStorage {

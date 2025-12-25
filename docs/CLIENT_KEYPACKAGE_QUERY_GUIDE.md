@@ -11,6 +11,34 @@ This guide explains how clients should query KeyPackages from the NIP-EE-RELAY i
 - Default: 1 KeyPackage per user per query (can be configured up to 2)
 - Rate limit: 10 queries per hour per requester-author pair
 
+### Encoding (client compatibility)
+
+- **Clients SHOULD publish KeyPackages with `encoding=base64`** in the `tags` and base64 in `content`.
+- **The relay will accept both encodings on ingest**:
+  - If the `encoding` tag is absent, the relay treats `content` as **hex** (legacy behavior)
+  - If `encoding=base64`, the relay treats `content` as **base64**
+- **The relay stores KeyPackages canonically as base64 internally** (efficiency).
+- **When querying via REQ, the relay returns KeyPackages with hex `content` by default** for backward compatibility with deployed clients.
+
+#### Requesting base64 output via REQ
+
+Clients that want base64 output can add a format hint using a standard single-letter tag filter:
+
+```json
+["REQ", "kp_query_b64", {
+  "kinds": [443],
+  "authors": ["alice_hex_pubkey"],
+  "#f": ["base64"]
+}]
+```
+
+When `#f:["base64"]` is present on a `kind:443` query:
+
+- returned 443 events use **base64** in `content`
+- returned events include tag `["encoding","base64"]`
+
+If `#f` is absent, the relay returns **hex** in `content` (default).
+
 ## Query Format
 
 ### Basic Query Structure

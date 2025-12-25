@@ -1,0 +1,179 @@
+# MIP-00
+
+## Credentials & Key Packages
+
+`review` `mandatory`
+
+This document defines the credential management and KeyPackage system for Marmot Protocol. This is one of the core specifications that MUST be implemented by all projects wanting to be interoperable. Marmot identity builds on Nostr keypairs, with MLS Credentials proving group membership and KeyPackages enabling asynchronous invitations. This creates a secure bridge between Nostr's decentralized identity and MLS's group encryption.
+
+## MLS Credentials
+
+MLS `Credentials` link Nostr identities to group-specific signing keys, functioning as cryptographically secure membership proofs.
+
+### Identity Requirements
+
+When creating credentials, clients MUST:
+
+- **Use BasicCredential type**: The standard MLS credential format
+- **Set identity to Nostr pubkey**: The identity field MUST contain the raw 32-byte public key (not hex-encoded). This is the binary representation of the user's Nostr public key.
+- **Keep identity immutable**: Never allow changes to the identity field
+- **Validate proposals**: Reject any `Proposal` or `Commit` that attempts to change identity fields
+
+**Note on encoding**: The identity field contains raw bytes. For a Nostr public key like `884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6` (64 hex characters), the identity field should contain the 32 decoded bytes `[0x88, 0x47, 0x04, 0xbd, ...]`, not the 64 UTF-8 bytes of the hex string.
+
+### Signing Keys
+
+Each credential includes a unique signing key (distinct from Nostr identity) that signs MLS messages and should rotate regularly for enhanced security. The curve used for the signing key is determined by the [MLS ciphersuite](https://www.rfc-editor.org/rfc/rfc9420.html#section-17.1) used by the client. All MLS ciphersuites are supported and are signaled to other users via the `mls_ciphersuite` tag in KeyPackage events.
+
+## KeyPackage Events
+
+KeyPackages function as public "invitation cards" enabling asynchronous group invitations. They advertise capabilities, provide credentials, and include signing keys for authentication. Users can publish them via Nostr relays or share directly between devices.
+
+### KeyPackage Consumption and Reuse
+
+KeyPackages are typically consumed when joining groups. To handle race conditions where multiple invites use the same KeyPackage, use the [`last_resort`](https://datatracker.ietf.org/doc/html/draft-ietf-mls-extensions-03#section-4.2.5) extension for reusability. Clients MUST rotate signing keys quickly after using last resort KeyPackages and retain private keys for all groups.
+
+### Example KeyPackage Event
+
+```json
+{
+  "id": "abc123...",
+  "kind": 443,
+  "created_at": 1693876543,
+  "pubkey": "f1e2d3c4b5a697887766554433221100ffeeddccbbaa99887766554433221100",
+  "content": "SGVsbG8xMjM0NTY3ODlhYmNkZWY...",
+  "tags": [
+    ["mls_protocol_version", "1.0"],
+    ["mls_ciphersuite", "0x0001"],
+    ["mls_extensions", "0xf2ee", "0x000a"],
+    ["encoding", "base64"],
+    ["client", "MyMLSClient"],
+    ["relays", "wss://relay1.com", "wss://relay2.com"],
+    ["-"]
+  ],
+  "sig": "304502210..."
+}
+```
+
+The `mls_extensions` tag includes marmot_group_data (`0xf2ee`) and last_resort (`0x000a`) extensions which MUST be included.
+
+### Field Explanations
+
+**Required fields:**
+- **`content`**: TLS-serialized `KeyPackageBundle` from your MLS implementation. New implementations MUST use base64 encoding.
+- **`encoding`**: Specifies the encoding format of the `content` field:
+  - `["encoding", "base64"]` - Content is base64-encoded (~33% smaller, **required for new implementations**)
+  - `["encoding", "hex"]` or tag absent - Content is hex-encoded (**deprecated**, for backward compatibility only)
+
+  Hex encoding is deprecated and will be removed in a future version. Implementations MUST support reading both formats but MUST write base64.
+- **`mls_protocol_version`**: MLS protocol version - currently `1.0`
+- **`mls_ciphersuite`**: MLS ciphersuite ID (see [MLS spec](https://www.rfc-editor.org/rfc/rfc9420.html#name-mls-cipher-suites))
+- **`mls_extensions`**: Array of supported non-default MLS extension IDs (see [MLS spec](https://www.rfc-editor.org/rfc/rfc9420.html#name-extensions)). Default extensions MUST NOT be listed. This signals **individual client capabilities** via `LeafNode.capabilities` in KeyPackages. Marmot implementations MUST include the `0xf2ee` extension for marmot_group_data and the `0x000a` extension for last_resort.
+- **`relays`**: Relay URLs where this KeyPackage is published (needed for later deletion when using relay distribution)
+
+**Optional fields:**
+- **`client`**: Client name to help with UX when users can't access signing keys (may be omitted for privacy). Format: `["client", "<name>"]`
+- **`-`**: Ensures only the author can publish this event (see [NIP-70](https://github.com/nostr-protocol/nips/blob/master/70.md))
+
+### KeyPackage Lifecycle Management
+
+#### When to Delete KeyPackages (relay-based distribution)
+
+Clients SHOULD delete KeyPackages from relays when:
+
+- **Successfully joining a group**: Delete the KeyPackage after processing a `Welcome` message
+- **Creating new KeyPackages**: Optionally replace old ones with fresh KeyPackages
+
+#### When NOT to Delete KeyPackages (relay-based distribution)
+
+Clients MUST NOT delete KeyPackages when:
+
+- **Welcome processing fails**: If you can't process a Welcome message (e.g., signing key generated on another device)
+- **Show clear errors**: Display user-friendly error messages explaining the issue
+
+> **Note**: For direct device-to-device KeyPackage sharing (QR code, Wi-Fi, Bluetooth, NFC), deletion considerations don't apply as the KeyPackage is transferred directly rather than stored on relays.
+
+### Signing Key Rotation
+
+All group members should regularly rotate their signing key within each group they are a part of on a regular basis. This limits compromise impact and improves forward secrecy per MLS best practices. This is done by creating an [update proposal](https://www.rfc-editor.org/rfc/rfc9420.html#name-update) to update your own leaf node. For more info on `Proposal` and `Commit` operations please refer to [MIP-03](03.md).
+
+### KeyPackage Relays List Event
+
+When using relay-based KeyPackage distribution, users publish a `kind: 10051` event to advertise which relays contain their KeyPackages. This helps others know where to look for your KeyPackages when they want to invite you to groups.
+
+#### Requirements (for relay-based distribution)
+
+- **Include relay tags**: List all relays where you publish KeyPackages
+- **Make them accessible**: These relays SHOULD be readable by anyone you want to receive invites from
+- **Keep updated**: Update this list when you change your relay setup
+
+#### Example Relays List Event
+
+```json
+{
+  "kind": 10051,
+  "tags": [
+    ["relay", "wss://inbox.nostr.wine"],
+    ["relay", "wss://myrelay.nostr1.com"]
+  ],
+  "content": "",
+  "created_at": 1693876543,
+  "pubkey": "f1e2d3c4b5a697887766554433221100ffeeddccbbaa99887766554433221100",
+  "sig": "304502210..."
+}
+```
+
+## Summary
+
+This MIP defines the foundation of Marmot's identity system:
+
+### Key Components
+
+1. **MLS Credentials**: Link Nostr identities to MLS signing keys
+2. **KeyPackages** (`kind: 443`): Advertise your ability to join groups (via relays or direct sharing)
+3. **Relay Lists** (`kind: 10051`): Where to find your KeyPackages (for relay-based distribution)
+4. **Signing Key Rotation**: Regular key updates for enhanced security
+
+### Implementation Requirements
+
+**MUST implement**:
+- Credential management linking Nostr identities to MLS signing keys
+- KeyPackage lifecycle management with last resort support
+- Regular signing key rotation in all groups
+- Immutable credential identity validation
+
+### Extension Signaling Locations
+
+MLS extensions can be signaled in two distinct locations with different purposes:
+
+#### 1. Individual Client Capabilities (KeyPackage Level)
+- **Location**: `LeafNode.capabilities` in KeyPackage objects
+- **Purpose**: Signals what protocol features an individual client supports
+- **Implementation**: Advertised via the `mls_extensions` tag in KeyPackage events
+- **Scope**: Per-client capabilities that may vary between group members
+
+#### 2. Group-Level Requirements (GroupContext Level)
+- **Location**: `GroupContext.extensions` field
+- **Purpose**: Defines protocol extensions that all group members must support
+- **Implementation**: Updated via GroupContextExtensions proposals
+- **Scope**: Group-wide requirements that apply to all members
+
+#### Relationship Between Capabilities and Requirements
+- **Compatibility Enforcement**: When processing Add proposals, implementations MUST verify that new members' `LeafNode.capabilities` support all `GroupContext.extensions`
+- **Mandatory Support**: Any extension in use by the group MUST be supported by all members
+- **Negotiation**: The RFC describes a TLS-like extension negotiation mechanism where individual capabilities are advertised and group requirements are established
+
+### Default Extensions Clarification
+
+According to [RFC 9420 Section 7.2](https://www.rfc-editor.org/rfc/rfc9420.html#section-7.2-4), the following extension types are considered "default" and MUST NOT be listed in capabilities:
+
+- `0x0001` - application_id
+- `0x0002` - ratchet_tree
+- `0x0003` - required_capabilities
+- `0x0004` - external_pub
+- `0x0005` - external_senders
+
+Implementations MUST:
+- Filter out default extensions when building capabilities
+- Only include custom/non-default extensions (like `0xf2ee` for marmot_group_data, and `0x000a` for last_resort, which Marmot implementations MUST include)
+- Consider default extensions as implicitly supported by all MLS implementations
